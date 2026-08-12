@@ -1,0 +1,105 @@
+// ---------------------------------------------------------------------------
+// Local store — the source of truth. The spreadsheet is a publication target,
+// not the database: rows only leave here on an explicit, reviewed push.
+//
+// SQLite by default so logging hours never depends on Docker being up. To share
+// lp-internal-ai-v1's Postgres instead, change provider to "postgresql", point
+// DATABASE_URL at it, and re-run `pnpm db:push` — no model changes needed.
+// ---------------------------------------------------------------------------
+
+// Prisma 7's native generator — emits ESM TypeScript into `output`, so there is
+// no dependency on the legacy @prisma/client runtime shape.
+generator client {
+  provider     = "prisma-client"
+  output       = "../generated/client"
+  runtime      = "nodejs"
+  moduleFormat = "esm"
+}
+
+// Prisma 7 takes the connection URL from prisma.config.ts (CLI) and from the
+// driver adapter passed to PrismaClient (runtime) — not from this block.
+datasource db {
+  provider = "sqlite"
+}
+
+/// One observed, timestamped piece of evidence. Append-only and never edited —
+/// signals are the audit trail that justifies every inferred entry.
+model Signal {
+  id         String   @id @default(cuid())
+  /// Stable dedupe key, e.g. git:<repo>:<sha>. Re-collecting is idempotent.
+  sourceId   String   @unique
+  kind       String
+  at         DateTime
+  projectKey String?
+  subject    String?
+  /// JSON array of touched paths.
+  pathsJson  String?
+  /// Set once the signal has been folded into an entry, so re-running
+  /// reconstruction does not double-count work already logged.
+  consumedAt DateTime?
+  createdAt  DateTime @default(now())
+
+  @@index([at])
+  @@index([projectKey, at])
+  @@index([consumedAt])
+}
+
+/// A running timer. At most one may be open at a time — enforced in code, since
+/// SQLite cannot express a partial unique index through Prisma.
+model Timer {
+  id         String   @id @default(cuid())
+  projectKey String
+  activity   String?
+  note       String?
+  startedAt  DateTime
+  stoppedAt  DateTime?
+
+  @@index([stoppedAt])
+}
+
+/// A reviewable timesheet row. draft → approved → pushed, one direction only.
+model Entry {
+  id         String   @id @default(cuid())
+  /// Local calendar day, YYYY-MM-DD.
+  day        String
+  person     String
+  projectKey String
+  minutes    Int
+  activity   String
+  /// JSON array of {startMin,endMin} clock ranges.
+  rangesJson String
+  description String?
+  status     String   @default("draft")
+  /// Why the tool believed this. Never written to the sheet.
+  provenance String?
+  /// JSON array of the signal sourceIds this entry was inferred from. Lets a
+  /// dropped draft release its signals back into the pool instead of losing
+  /// that time forever. Null for a manually logged entry.
+  signalIdsJson String?
+  /// Set on a successful push; the A1 range the row landed in.
+  sheetRange String?
+  pushedAt   DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([day, person])
+  @@index([status])
+  @@index([projectKey, day])
+}
+
+/// One push attempt, successful or not. Kept forever: this is the answer to
+/// "did that row actually make it into the sheet, and when?"
+model PushLog {
+  id         String   @id @default(cuid())
+  projectKey String
+  sheetTab   String
+  rowCount   Int
+  minutes    Int
+  ok         Boolean
+  error      String?
+  /// JSON array of the entry ids included.
+  entryIds   String
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+}

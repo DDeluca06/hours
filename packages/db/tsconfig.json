@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // rootDir spans the package, not just src/, because the Prisma client is
+    // generated into ../generated and imported from src/.
+    "rootDir": ".",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts", "generated/**/*.ts"],
+  "exclude": ["src/**/*.test.ts"]
+}

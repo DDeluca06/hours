@@ -1,0 +1,23 @@
+{
+  "name": "@hours/collector",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/exports.ts",
+      "default": "./src/exports.ts"
+    }
+  },
+  "scripts": {
+    "start": "tsx --env-file-if-exists=../../.env src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@hours/config": "workspace:*",
+    "@hours/core": "workspace:*",
+    "@hours/lib-db": "workspace:*"
+  }
+}

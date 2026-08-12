@@ -1,0 +1,22 @@
+{
+  "name": "@hours/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "hours": "./dist/index.js"
+  },
+  "scripts": {
+    "start": "tsx --env-file-if-exists=../../.env src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@hours/collector": "workspace:*",
+    "@hours/config": "workspace:*",
+    "@hours/connector-google-sheets": "workspace:*",
+    "@hours/core": "workspace:*",
+    "@hours/lib-db": "workspace:*"
+  }
+}

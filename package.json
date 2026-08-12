@@ -1,0 +1,36 @@
+{
+  "name": "hours",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:studio": "prisma studio",
+    "hours": "tsx --env-file-if-exists=.env apps/cli/src/index.ts",
+    "collect": "tsx --env-file-if-exists=.env apps/collector/src/index.ts",
+    "mcp": "tsx --env-file-if-exists=.env apps/mcp-server/src/index.ts",
+    "sheets:probe": "tsx --env-file-if-exists=.env connectors/google-sheets/src/probe.ts",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@prisma/client": "^7.9.1",
+    "@types/node": "^22",
+    "dotenv": "^16.4.5",
+    "eslint": "^9.0.0",
+    "prettier": "^3.3.0",
+    "prisma": "^7.8.0",
+    "tsx": "^4.22.4",
+    "typescript": "^5.4.5",
+    "typescript-eslint": "^8.65.0",
+    "vitest": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=22",
+    "pnpm": ">=10"
+  }
+}
