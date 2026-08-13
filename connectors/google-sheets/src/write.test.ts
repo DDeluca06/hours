@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Entry } from '@hours/core';
-import { findDuplicates } from './write.js';
+import { findDuplicates, lastRealRow } from './write.js';
 import type { ExistingRow } from './read.js';
 
 function entry(over: Partial<Entry> = {}): Entry {
@@ -62,9 +62,47 @@ describe('findDuplicates', () => {
     expect(dups).toHaveLength(1);
   });
 
+  // "8/1" is a prefix of "8/12"; a naive startsWith match would flag an Aug 1
+  // push as duplicating an Aug 12 row.
+  it('is quiet when the sheet date only shares a prefix', () => {
+    expect(findDuplicates([entry({ day: '2026-08-01' })], [row({ dateText: '8/12' })])).toEqual([]);
+  });
+
+  // The tab carries rows from earlier years. Dropping the year to make "8/1"
+  // stop matching "8/12" must not make 2/26/25 match an entry for 2/26/26.
+  it('is quiet when the sheet row is the same day in a different year', () => {
+    expect(
+      findDuplicates([entry({ day: '2026-02-26' })], [row({ dateText: '2/26/25' })]),
+    ).toEqual([]);
+  });
+
+  it('matches the same day written the same way', () => {
+    const dups = findDuplicates([entry({ day: '2026-08-01' })], [row({ dateText: '8/1' })]);
+    expect(dups).toHaveLength(1);
+  });
+
   it('reports the index of each duplicated entry', () => {
     const dups = findDuplicates([entry({ activity: 'Scoping' }), entry()], [row()]);
     expect(dups).toHaveLength(1);
     expect(dups[0]?.entryIndex).toBe(1);
+  });
+});
+
+describe('lastRealRow', () => {
+  it('is the last parsed row', () => {
+    expect(lastRealRow([row({ sheetRow: 7 }), row({ sheetRow: 19 }), row({ sheetRow: 12 })], 1)).toBe(19);
+  });
+
+  it('falls back to the header row on an empty tab', () => {
+    expect(lastRealRow([], 1)).toBe(1);
+  });
+
+  // readTab keeps stray cells that carry a date but no person (dropdown
+  // leftovers, like the North10AI rows 148-157 case); they must not count as
+  // data, so the append lands right below the real rows.
+  it('ignores junk below the data (the North10AI rows 148-157 case)', () => {
+    expect(
+      lastRealRow([row({ sheetRow: 19 }), row({ sheetRow: 148, person: '' })], 1),
+    ).toBe(19);
   });
 });

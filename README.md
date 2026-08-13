@@ -14,11 +14,18 @@ collects evidence all day, drafts your timesheet from it, and makes you review t
 before anything reaches a spreadsheet the whole team reads.
 
 ```
-git commits ─┐
-branch moves ─┤
-Claude sessions ─┴─►  signals  ──►  blocks  ──►  draft entries  ──►  approved  ──►  sheet
-              (append-only)   (inferred)      (you review)      (you confirm)
+git commits ─────┐
+branch moves ────┤
+Claude Code ─────┤
+OpenCode ────────┤
+editor saves ────┴─►  signals  ──►  blocks  ──►  draft entries  ──►  approved  ──►  sheet
+                  (append-only)   (inferred)      (you review)      (you confirm)
 ```
+
+Commits say *what* you did and almost nothing about *how long*. The agent harnesses fill
+that in: a turn is read as a measured span — when it started, when it finished — so a
+45-minute autonomous run is 45 minutes rather than a guess. See
+[docs/harnesses.md](docs/harnesses.md).
 
 Four properties hold that pipeline together:
 
@@ -61,8 +68,8 @@ pnpm hours status                        # timer, today's entries, uncounted sig
 # at 3 PM
 pnpm hours reconstruct                   # collect signals, draft the day
 pnpm hours review                        # see drafts and why the tool believes them
-pnpm hours edit a1b2c3 --minutes 2h --activity dev
-pnpm hours approve --day today
+pnpm hours approve --day today           # asks for a brief note on each entry that has none
+pnpm hours edit a1b2c3 --minutes 2h --activity dev --note "what you did"
 pnpm hours push --dry-run                # exactly what would be appended
 pnpm hours push                          # asks before writing
 ```
@@ -89,17 +96,34 @@ session, and lets Claude working in either repo record its own time. Registratio
 instructions are in [docs/mcp.md](docs/mcp.md).
 
 Tools: `list_projects` `get_day` `sheet_summary` `log_time` `start_timer` `stop_timer`
-`timer_status` `reconstruct_day` `approve_day` `push_to_sheet`.
+`timer_status` `reconstruct_day` `edit_entry` `approve_day` `push_to_sheet`.
 
 `push_to_sheet` requires an explicit `confirm: true`. Called with `confirm: false` it prints
 the exact rows and writes nothing.
 
+The Notes column holds the clock range plus a brief what-did-you-do description. Interactive
+`hours approve` asks for one on every entry that has none; in the MCP, call `edit_entry` with
+a `note` after `reconstruct_day` and before `approve_day`.
+
 ## Credentials
 
-`GOOGLE_SERVICE_ACCOUNT_JSON` is base64-encoded service-account JSON — the same value and
-encoding `lp-internal-ai-v1` already uses, so you can reuse that one. **The service account's
-email must be shared into the spreadsheet as an Editor**; read access is not enough, and the
-failure shows up as a 403 at push time.
+Two ways to authenticate, one of which must be configured to push:
+
+**OAuth (recommended, self-service).** A Desktop-app OAuth client in any Google Cloud
+project with the Sheets API enabled. Put its id and secret in `.env`, then authorize once:
+
+```bash
+pnpm sheets:auth     # opens a browser for one-time consent
+```
+
+The refresh token is stored at `GOOGLE_OAUTH_TOKEN_PATH` (default
+`~/.config/hours/credentials.json`, mode 0600) and refreshed silently forever after. The
+consenting Google account is the push principal — it must already be an Editor of the sheet.
+
+**Service account (fallback).** `GOOGLE_SERVICE_ACCOUNT_JSON` is base64-encoded
+service-account JSON — the same value and encoding `lp-internal-ai-v1` uses, so you can reuse
+that one. **The service account's email must be shared into the spreadsheet as an Editor**;
+read access is not enough, and the failure shows up as a 403 at push time.
 
 Once credentials exist, run this before your first push:
 
@@ -134,6 +158,9 @@ Secrets stay in `.env`; project definitions stay out of it.
 
 Adding a third engagement needs no code change — add it here.
 
+Which harnesses and editors get read is configured the same way, under a `harnesses` key —
+all of them by default. See [docs/harnesses.md](docs/harnesses.md).
+
 ## Layout
 
 | Path | What |
@@ -142,14 +169,14 @@ Adding a third engagement needs no code change — add it here.
 | `packages/config` | Env + `hours.config.json` loading. |
 | `packages/db` | Prisma schema and repositories. SQLite by default. |
 | `connectors/google-sheets` | Tab layout discovery, reads, and the guarded append. |
-| `apps/collector` | Signal sources (git, Claude sessions) and the sweep daemon. |
+| `apps/collector` | Signal sources (git, Claude Code, OpenCode, editor history) and the sweep daemon. |
 | `apps/cli` | The `hours` command. |
 | `apps/mcp-server` | MCP tools for Claude. |
 
 ## Commands
 
 ```bash
-pnpm test          # 92 tests
+pnpm test          # 248 tests
 pnpm -r typecheck
 pnpm lint
 pnpm db:studio     # browse the local store

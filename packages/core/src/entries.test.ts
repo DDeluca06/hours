@@ -42,6 +42,19 @@ describe('toSheetRow', () => {
     const row = toSheetRow(entry({ provenance: 'inferred from 3 commits' }));
     expect(JSON.stringify(row)).not.toContain('inferred');
   });
+
+  it('prefixes the task ref before the clock range', () => {
+    const row = toSheetRow(entry({ taskId: '136', description: 'Stand-up' }));
+    expect(row.notes).toBe('[#136] 9:00 - 10:45 | Stand-up');
+  });
+
+  it('is exactly the task ref alone when there is no range or description', () => {
+    expect(toSheetRow(entry({ taskId: '136', ranges: [] })).notes).toBe('[#136]');
+  });
+
+  it('omits the ref when the entry has no taskId', () => {
+    expect(toSheetRow(entry()).notes).toBe('9:00 - 10:45');
+  });
 });
 
 describe('summarizeSubjects', () => {

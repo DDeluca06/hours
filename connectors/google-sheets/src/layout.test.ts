@@ -51,7 +51,14 @@ describe('discoverLayout', () => {
     const l = discoverLayout('Some Tab', withPivots);
     expect(l?.notesCol).toBeNull();
     expect(l?.dataWidth).toBe(4);
-    expect(appendRange(l!)).toBe("'Some Tab'!A1:D");
+    expect(appendRange(l!, 0)).toBe("'Some Tab'!A1:D1");
+  });
+
+  // Stray cells parked far below the data (North10AI has 10 at rows 148-157)
+  // must not drag the append to the bottom of the sheet.
+  it('targets the row just past the last real data row, not the sheet bottom', () => {
+    const l = discoverLayout('North10AI', [['Date', 'Person', 'Hours', 'Activity', 'Notes']]);
+    expect(appendRange(l!, 19)).toBe("'North10AI'!A20:E20");
   });
 
   it('returns null for a tab with no recognizable header', () => {

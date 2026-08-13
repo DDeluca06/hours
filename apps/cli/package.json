@@ -16,6 +16,7 @@
     "@hours/collector": "workspace:*",
     "@hours/config": "workspace:*",
     "@hours/connector-google-sheets": "workspace:*",
+    "@hours/connector-openproject": "workspace:*",
     "@hours/core": "workspace:*",
     "@hours/lib-db": "workspace:*"
   }

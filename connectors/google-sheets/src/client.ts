@@ -1,27 +1,77 @@
 // ---------------------------------------------------------------------------
 // Google Sheets client.
 //
-// Same auth convention as lp-internal-ai-v1's connector: a base64-encoded
-// service-account JSON in GOOGLE_SERVICE_ACCOUNT_JSON. The service account's
-// email must be shared into the spreadsheet as an Editor — read access is not
-// enough for the push path, and the failure mode is a 403 at append time.
+// Two auth paths, one of which must be configured to push:
+//
+//   oauth (recommended)     — GOOGLE_OAUTH_CLIENT_ID/SECRET + a refresh token
+//                             saved by `pnpm sheets:auth`. The consenting user
+//                             is the principal, so no sheet sharing changes
+//                             are needed beyond their existing edit access.
+//   service account         — base64-encoded service-account JSON in
+//                             GOOGLE_SERVICE_ACCOUNT_JSON, same convention as
+//                             lp-internal-ai-v1. Its email must be shared into
+//                             the spreadsheet as an Editor — read access is not
+//                             enough for the push path, and the failure mode is
+//                             a 403 at append time.
 // ---------------------------------------------------------------------------
 
-import { google, type sheets_v4 } from 'googleapis';
-import { requirePushConfig } from '@hours/config';
+import { google, type Auth, type sheets_v4 } from 'googleapis';
+import { requirePushConfig, type AuthSpec } from '@hours/config';
+import { loadTokens, saveTokens, tokensMatch, type StoredTokens } from './tokens.js';
 
 let cachedSheets: sheets_v4.Sheets | null = null;
 
-export function getSheets(): sheets_v4.Sheets {
-  if (cachedSheets) return cachedSheets;
-  const { serviceAccountJson } = requirePushConfig();
-  const keyJson = Buffer.from(serviceAccountJson, 'base64').toString('utf-8');
-  const auth = new google.auth.GoogleAuth({
+function makeOAuthClient(spec: AuthSpec & { kind: 'oauth' }): Auth.OAuth2Client {
+  const stored = loadTokens(spec.tokenPath);
+  if (!stored) {
+    throw new Error(
+      `no OAuth token at ${spec.tokenPath} — run \`pnpm sheets:auth\` to authorize once.`,
+    );
+  }
+  if (!tokensMatch(stored, spec)) {
+    throw new Error(
+      `the token at ${spec.tokenPath} belongs to a different OAuth client — run \`pnpm sheets:auth\` again.`,
+    );
+  }
+  const auth = new google.auth.OAuth2(spec.clientId, spec.clientSecret);
+  auth.setCredentials({
+    refresh_token: stored.refreshToken,
+    access_token: stored.accessToken ?? null,
+    expiry_date: stored.expiryDate ?? null,
+  });
+  auth.on('tokens', (tokens) => {
+    const next: StoredTokens = {
+      clientId: stored.clientId,
+      refreshToken: tokens.refresh_token ?? stored.refreshToken,
+      ...(tokens.access_token ? { accessToken: tokens.access_token } : {}),
+      ...(tokens.expiry_date ? { expiryDate: tokens.expiry_date } : {}),
+    };
+    try {
+      saveTokens(spec.tokenPath, next);
+    } catch {
+      // A failed persist (disk full, permissions) must not kill this run — the
+      // in-memory access token still works, and the refresh is retried next run.
+      console.error(
+        `could not persist refreshed token at ${spec.tokenPath} — it will be refreshed again on the next run`,
+      );
+    }
+  });
+  return auth;
+}
+
+function makeAuthClient(auth: AuthSpec): Auth.OAuth2Client | Auth.GoogleAuth {
+  if (auth.kind === 'oauth') return makeOAuthClient(auth);
+  const keyJson = Buffer.from(auth.serviceAccountJson, 'base64').toString('utf-8');
+  return new google.auth.GoogleAuth({
     credentials: JSON.parse(keyJson) as object,
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  cachedSheets = google.sheets({ version: 'v4', auth: auth as any });
+}
+
+export function getSheets(): sheets_v4.Sheets {
+  if (cachedSheets) return cachedSheets;
+  const { auth } = requirePushConfig();
+  cachedSheets = google.sheets({ version: 'v4', auth: makeAuthClient(auth) });
   return cachedSheets;
 }
 

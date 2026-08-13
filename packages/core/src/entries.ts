@@ -36,6 +36,11 @@ export interface Entry {
    * Absent on a manually logged entry.
    */
   signalIds?: string[];
+  /**
+   * OpenProject work package id (e.g. "136") the minutes were logged against.
+   * Optional: not every entry belongs to a task.
+   */
+  taskId?: string;
 }
 
 /** The four columns the writer appends, in sheet order. */
@@ -66,6 +71,13 @@ export function entryFromBlock(
   };
   const description = summarizeSubjects(block.subjects);
   if (description) entry.description = description;
+  if (block.taskId !== undefined) {
+    // The sheet never sees provenance (Notes come from ranges + description),
+    // so the mention is for the reviewer alone: it names where the task link
+    // came from, so "why is this on #136?" is answerable at review time.
+    entry.taskId = block.taskId;
+    entry.provenance = `${entry.provenance}, task #${block.taskId} via refs`;
+  }
   return entry;
 }
 
@@ -88,7 +100,11 @@ export function summarizeSubjects(subjects: readonly string[], max = 2): string 
 /** Render an Entry into the exact cells to append. */
 export function toSheetRow(entry: Entry, date = new Date(`${entry.day}T12:00:00`)): SheetRow {
   const rangeText = formatClockRanges(entry.ranges);
-  const notes = [rangeText, entry.description].filter(Boolean).join(' | ');
+  // The sheet has no task column; Notes is the only slot, so the ref goes at
+  // the front, same as clock ranges. Trimmed: with no range and no
+  // description the cell is exactly "[#136]", not "[#136] ".
+  const ref = entry.taskId ? `[#${entry.taskId}] ` : '';
+  const notes = (ref + [rangeText, entry.description].filter(Boolean).join(' | ')).trim();
   return {
     date: formatSheetDate(date),
     person: entry.person,

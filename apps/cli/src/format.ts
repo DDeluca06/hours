@@ -72,17 +72,20 @@ export function renderEntries(entries: readonly StoredEntry[], opts: { showProve
 
   const rows = entries.map((e) => [
     dim(shortId(e.id)),
+    // The task ref sits right after the id, same slot as describeEntries —
+    // "[#136] " is 7 wide, padded so refs of different lengths still align.
+    e.taskId ? `[#${e.taskId}]`.padEnd(7) : '',
     STATUS_MARK[e.status],
     e.day,
     e.projectKey,
     e.activity,
     formatMinutesShort(e.minutes),
     e.ranges.length ? formatClockRanges(e.ranges) : dim('—'),
-    e.description ?? '',
+    e.description ?? dim('(no note)'),
   ]);
 
   const table = renderTable(
-    ['ID', '', 'DAY', 'PROJECT', 'ACTIVITY', 'TIME', 'WHEN', 'NOTES'],
+    ['ID', 'TASK', '', 'DAY', 'PROJECT', 'ACTIVITY', 'TIME', 'WHEN', 'NOTES'],
     rows,
   );
 

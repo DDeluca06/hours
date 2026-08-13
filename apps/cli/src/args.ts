@@ -12,6 +12,24 @@ export interface ParsedArgs {
   flags: Record<string, string | true>;
 }
 
+/**
+ * Flags that never take a value.
+ *
+ * Without this the greedy "next non-flag token is the value" rule swallows a
+ * positional: `hours approve --no-prompt 1a2b3c` set `no-prompt` to the entry
+ * id, so the prompt still ran *and* the id never reached `positionals`.
+ */
+const BOOLEAN_FLAGS = new Set([
+  'all',
+  'allow-duplicates',
+  'dry-run',
+  'help',
+  'no-collect',
+  'no-prompt',
+  'refresh',
+  'yes',
+]);
+
 export function parseArgs(argv: readonly string[]): ParsedArgs {
   const [command = 'help', ...rest] = argv;
   const positionals: string[] = [];
@@ -26,6 +44,10 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
       const eq = body.indexOf('=');
       if (eq !== -1) {
         flags[body.slice(0, eq)] = body.slice(eq + 1);
+        continue;
+      }
+      if (BOOLEAN_FLAGS.has(body)) {
+        flags[body] = true;
         continue;
       }
       // A following token that is not itself a flag is this flag's value;

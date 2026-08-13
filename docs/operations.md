@@ -105,6 +105,19 @@ Editor. Read access is not enough.
 `hours status` for uncounted signals, and remember that work outside a watched repo is reported
 as unattributed rather than assigned.
 
+**A harness contributed nothing** — `hours collect` prints a line per source, and a source with
+no signals is omitted rather than reported as zero. Check in order: the store exists at all
+(`~/.claude/projects`, `~/.local/share/opencode/storage`, `<editor>/User/History`), the source
+is not switched off (`HOURS_HARNESS_*`), and the work happened inside the lookback window
+(`--days`, default 3). Editor history is additionally capped and filtered by the editor's own
+`workbench.localHistory.*` settings, so it is lossy by design. Details in
+[harnesses.md](harnesses.md).
+
+**A long agent turn still reports as ~20 minutes** — that block fell back to the lead-in guess,
+which means the turn carried no measured span. `hours review` says so: a measured block's reason
+reads `N measured harness spans`. The usual cause is a turn longer than `maxSpanMin` (default
+120, clamped deliberately) or a signal recorded before the span feature existed.
+
 **Wrong project on a draft** — `hours edit <id> --project <key>`.
 
 **`HOURS_DEBUG=1`** in front of any command turns the friendly error message back into a stack

@@ -26,22 +26,35 @@ import {
   toSheetRow,
   validateEntries,
   ACTIVITIES,
+  type Activity,
   type Entry,
 } from '@hours/core';
 import {
   approveEntries,
+  claimEntriesForPush,
   createEntries,
   currentTimer,
+  getTask,
   listEntries,
+  listOpenProjectTimeEntries,
+  listTaskMinutes,
   logPush,
   markPushed,
   pushedHours,
+  releasePushClaim,
   startTimer,
   stopTimer,
+  updateEntry,
+  upsertTasks,
   type StoredEntry,
 } from '@hours/lib-db';
 import { reconstruct, sweep } from '@hours/collector';
 import { previewPush, pushEntries, readTab, summarize } from '@hours/connector-google-sheets';
+import {
+  createTimeEntry,
+  getWorkPackage,
+  listTimeEntries,
+} from '@hours/connector-openproject';
 
 const cfg = loadConfig();
 
@@ -53,6 +66,14 @@ function text(body: string) {
 
 function fail(message: string) {
   return { content: [{ type: 'text' as const, text: message }], isError: true };
+}
+
+/** Accept only explicit YYYY-MM-DD keys that are real local dates. */
+function validDay(raw: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return false;
+  // new Date rolls impossible dates over (2026-02-30 becomes Mar 2), so a
+  // round-trip through localDayKey rejects them.
+  return localDayKey(new Date(`${raw}T00:00:00`)) === raw;
 }
 
 /** Resolve a project from an explicit key, or from the calling directory. */
@@ -73,12 +94,28 @@ function resolveProject(key?: string, cwd?: string) {
   );
 }
 
+/**
+ * Validate a taskId from the write tools against the local cache. A ref to a
+ * task the cache has never seen is refused, not guessed — the write path must
+ * not invent an attachment the user never confirmed. Returns the failure
+ * message, or null when the id is usable.
+ */
+async function checkTaskId(taskId: string): Promise<string | null> {
+  if (!/^\d+$/.test(taskId) || Number(taskId) <= 0) {
+    return `"${taskId}" is not a task id — use a positive integer like "136"`;
+  }
+  if ((await getTask(taskId)) === null) {
+    return `task #${taskId} is not in the local cache — call task_hours with refresh: true to cache it first, or wait for the next sweep`;
+  }
+  return null;
+}
+
 function describeEntries(entries: readonly StoredEntry[]): string {
   if (entries.length === 0) return '(none)';
   return entries
     .map(
       (e) =>
-        `${e.id.slice(-6)}  ${e.status.padEnd(8)} ${e.day}  ${e.projectKey.padEnd(8)} ` +
+        `${e.id.slice(-6)}  ${e.taskId ? `[#${e.taskId}] `.padEnd(7) : ''}${e.status.padEnd(8)} ${e.day}  ${e.projectKey.padEnd(8)} ` +
         `${e.activity.padEnd(16)} ${formatMinutesShort(e.minutes).padEnd(7)} ` +
         `${e.ranges.length ? formatClockRanges(e.ranges) : '—'}` +
         (e.description ? `  ${e.description}` : ''),
@@ -122,6 +159,7 @@ server.registerTool(
     },
   },
   async ({ day }) => {
+    if (day !== undefined && !validDay(day)) return fail(`${day} is not a YYYY-MM-DD day`);
     const target = day ?? localDayKey(new Date());
     const entries = await listEntries({ day: target });
     const total = entries.reduce((s, e) => s + e.minutes, 0);
@@ -193,6 +231,147 @@ server.registerTool(
   },
 );
 
+// --- task hours ------------------------------------------------------------
+
+server.registerTool(
+  'task_hours',
+  {
+    title: 'Task hours',
+    description:
+      'Whether a task (OpenProject work package) has hours attached: what OpenProject itself reports, what is already in the sheet locally, and what is still a draft. Reports the two ledgers separately — they can describe the same work, so they are never summed.',
+    inputSchema: {
+      taskId: z.string().describe('OpenProject work package id, e.g. "136".'),
+      refresh: z
+        .boolean()
+        .optional()
+        .describe('Re-fetch from OpenProject instead of answering from the cache.'),
+    },
+  },
+  async ({ taskId, refresh }) => {
+    try {
+      if (!/^\d+$/.test(taskId) || Number(taskId) <= 0) {
+        return fail(`"${taskId}" is not a task id — use a positive integer like "136"`);
+      }
+
+      let task = await getTask(taskId);
+      const op = cfg.openproject;
+      let note = '';
+      let refreshed = false;
+      let opMinutes: number | null = null;
+      let opEntryCount = 0;
+
+      if (op.url === undefined || op.apiKey === undefined) {
+        if (task === null) {
+          return fail(
+            `task #${taskId} has no hours attached locally, and OpenProject is not configured ` +
+              '(OPENPROJECT_URL/OPENPROJECT_API_KEY) — nothing to report',
+          );
+        }
+        note = 'OpenProject not configured (OPENPROJECT_URL/OPENPROJECT_API_KEY) — cached only';
+      } else if (refresh === true || task === null) {
+        try {
+          const [wp, timeEntries] = await Promise.all([
+            getWorkPackage({ url: op.url, apiKey: op.apiKey, id: taskId }),
+            listTimeEntries({ url: op.url, apiKey: op.apiKey, workPackage: taskId }),
+          ]);
+
+          let projectKey = task?.projectKey ?? taskId;
+          let projectWarning: string | null = null;
+          if (task === null) {
+            // The registry maps hours keys → OpenProject identifiers, and that
+            // direction cannot be inverted from the work package alone. One
+            // mapped project is unambiguous; more than one would be a guess, so
+            // the task is cached under its raw id instead (slice 3 attribution
+            // refines this).
+            const mapped = Object.entries(op.projects ?? {});
+            if (mapped.length === 1) {
+              projectKey = mapped[0]?.[0] ?? taskId;
+            } else if (mapped.length > 1) {
+              projectWarning = 'project unknown — cached under the raw id';
+            }
+          }
+
+          task =
+            (
+              await upsertTasks([
+                {
+                  id: taskId,
+                  projectKey,
+                  subject: wp.subject,
+                  ...(wp.status !== null ? { status: wp.status } : {}),
+                  ...(wp.spentMinutes !== null ? { spentMinutes: wp.spentMinutes } : {}),
+                  ...(wp.estimatedMinutes !== null
+                    ? { estimatedMinutes: wp.estimatedMinutes }
+                    : {}),
+                },
+              ])
+            )[0] ?? null;
+          refreshed = true;
+          opMinutes = timeEntries.totalMinutes;
+          opEntryCount = timeEntries.entries.length;
+          if (projectWarning !== null) note = projectWarning;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          if (task === null) return fail(message);
+          note = `OpenProject unreachable: ${message}`;
+        }
+      } else {
+        note = '(cached — pass refresh=true to re-check OpenProject)';
+      }
+
+      const local = (await listTaskMinutes()).find((m) => m.taskId === taskId);
+      const pushed = (local?.pushedMinutes ?? 0) + (local?.approvedMinutes ?? 0);
+      const drafts = local?.draftMinutes ?? 0;
+      // The union rule from the design doc: either ledger having hours makes
+      // the task "covered", but the two are never summed in one number.
+      const opSide = refreshed ? opMinutes ?? 0 : task?.spentMinutes ?? 0;
+      const attached = opSide > 0 || pushed + drafts > 0;
+
+      const lines: string[] = [
+        `task #${taskId} "${task?.subject ?? ''}" (${task?.projectKey ?? taskId}${
+          task?.status ? `, ${task.status}` : ''
+        })`,
+        `attached: ${attached ? 'yes' : 'no'}`,
+      ];
+
+      if (refreshed) {
+        lines.push(
+          `  OpenProject: ${formatMinutesShort(opMinutes ?? 0)} (${opEntryCount} time entr${
+            opEntryCount === 1 ? 'y' : 'ies'
+          })`,
+        );
+      } else if (task?.spentMinutes !== null && task?.spentMinutes !== undefined) {
+        lines.push(`  OpenProject: ${formatMinutesShort(task.spentMinutes)}`);
+      }
+
+      const localParts: string[] = [];
+      if (pushed > 0) {
+        // Approved is sheet-bound but not yet appended, so it folds into the
+        // pushed bucket — the count and the mention keep it visible.
+        const count = (local?.pushedEntries ?? 0) + (local?.approvedEntries ?? 0);
+        localParts.push(
+          `${formatMinutesShort(pushed)} pushed (${count} entr${count === 1 ? 'y' : 'ies'}${
+            local && local.approvedEntries > 0 ? `, incl. ${local.approvedEntries} approved` : ''
+          })`,
+        );
+      }
+      if (drafts > 0) {
+        localParts.push(
+          `${formatMinutesShort(drafts)} drafts (${local?.draftEntries ?? 0} entr${
+            (local?.draftEntries ?? 0) === 1 ? 'y' : 'ies'
+          })`,
+        );
+      }
+      if (localParts.length) lines.push(`  local sheet: ${localParts.join(' + ')}`);
+      if (note) lines.push('', note);
+
+      return text(lines.join('\n'));
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
 // --- drafting -------------------------------------------------------------
 
 server.registerTool(
@@ -214,11 +393,20 @@ server.registerTool(
         .string()
         .optional()
         .describe('Wall-clock start like "9:00" or "1:30 PM", so Notes can show a real range.'),
+      taskId: z
+        .string()
+        .optional()
+        .describe('OpenProject work package id to attach these minutes to, e.g. "136".'),
     },
   },
-  async ({ minutes, activity, project, cwd, day, note, startClock }) => {
+  async ({ minutes, activity, project, cwd, day, note, startClock, taskId }) => {
     try {
+      if (day !== undefined && !validDay(day)) return fail(`${day} is not a YYYY-MM-DD day`);
       const p = resolveProject(project, cwd);
+      if (taskId !== undefined) {
+        const problem = await checkTaskId(taskId);
+        if (problem !== null) return fail(problem);
+      }
       const resolved = resolveActivity(activity);
       if (!resolved) {
         return fail(
@@ -238,6 +426,7 @@ server.registerTool(
         provenance: 'logged via MCP',
       };
       if (note) entry.description = note;
+      if (taskId !== undefined) entry.taskId = taskId;
       if (startClock) {
         const { parseClockToken } = await import('@hours/core');
         const startMin = parseClockToken(startClock);
@@ -266,18 +455,27 @@ server.registerTool(
       cwd: z.string().optional(),
       activity: z.string().optional().describe('Can also be supplied when stopping.'),
       note: z.string().optional(),
+      taskId: z
+        .string()
+        .optional()
+        .describe('OpenProject work package id to attach the resulting entry to, e.g. "136".'),
     },
   },
-  async ({ project, cwd, activity, note }) => {
+  async ({ project, cwd, activity, note, taskId }) => {
     try {
       const p = resolveProject(project, cwd);
       const resolved = activity ? resolveActivity(activity) : null;
       if (activity && !resolved) return fail(`"${activity}" is not a recognizable activity`);
+      if (taskId !== undefined) {
+        const problem = await checkTaskId(taskId);
+        if (problem !== null) return fail(problem);
+      }
 
       const { started, replaced } = await startTimer({
         projectKey: p.key,
         ...(resolved ? { activity: resolved } : {}),
         ...(note ? { note } : {}),
+        ...(taskId ? { taskId } : {}),
       });
       return text(
         [
@@ -329,12 +527,18 @@ server.registerTool(
       projectKey: stopped.projectKey,
       minutes: stopped.minutes,
       activity: resolved,
+      // Not clamped at midnight: formatClock wraps, so a 23:00→00:30 timer
+      // reads "23:00 - 0:30", which is what happened. Clamping to 1440
+      // rendered it "23:00 - 0:00" — a range shorter than the minutes logged.
       ranges: [{ startMin, endMin: startMin + stopped.minutes }],
       status: 'draft',
       provenance: 'timer via MCP',
     };
     const description = note ?? stopped.note;
     if (description) entry.description = description;
+    // The timer carries its taskId forward when the entry is created — a task
+    // attachment belongs to the work, not to the stop.
+    if (stopped.taskId) entry.taskId = stopped.taskId;
 
     const [created] = await createEntries([entry]);
     return text(
@@ -367,7 +571,7 @@ server.registerTool(
   {
     title: 'Reconstruct a day from activity',
     description:
-      'Sweep git commits and Claude Code sessions, infer blocks of work, and write them as draft entries with the reasoning attached. Safe to re-run — signals already folded in are not counted twice.',
+      'Sweep every evidence source — git commits, Claude Code and OpenCode turns, editor saves — infer blocks of work, and write them as draft entries with the reasoning attached. Agent turns carry their measured duration; other signals get a conservative lead-in. Safe to re-run — signals already folded in are not counted twice.',
     inputSchema: {
       day: z.string().optional().describe('YYYY-MM-DD. Defaults to today.'),
       dryRun: z.boolean().optional().describe('Report what would be drafted without writing.'),
@@ -376,6 +580,7 @@ server.registerTool(
   },
   async ({ day, dryRun, collect }) => {
     try {
+      if (day !== undefined && !validDay(day)) return fail(`${day} is not a YYYY-MM-DD day`);
       const target = day ?? localDayKey(new Date());
       const lines: string[] = [];
 
@@ -429,6 +634,7 @@ server.registerTool(
     },
   },
   async ({ day, entryIds }) => {
+    if (day !== undefined && !validDay(day)) return fail(`${day} is not a YYYY-MM-DD day`);
     let ids = entryIds;
     if (!ids || ids.length === 0) {
       const target = day ?? localDayKey(new Date());
@@ -436,13 +642,99 @@ server.registerTool(
       if (drafts.length === 0) return text(`no drafts to approve on ${target}`);
       ids = drafts.map((d) => d.id);
     } else {
-      // Accept the short ids shown in other tools' output.
+      // Accept the short ids shown in other tools' output, but never silently
+      // pick the first suffix match — an ambiguous id must be refused like
+      // edit_entry does.
       const all = await listEntries({});
-      ids = ids.map((wanted) => all.find((e) => e.id === wanted || e.id.endsWith(wanted))?.id ?? wanted);
+      ids = ids.map((wanted) => {
+        const exact = all.find((e) => e.id === wanted);
+        if (exact) return exact.id;
+        const matches = all.filter((e) => e.id.endsWith(wanted));
+        if (matches.length === 1) return (matches[0] as StoredEntry).id;
+        if (matches.length === 0) throw new Error(`no entry matching "${wanted}"`);
+        throw new Error(
+          `"${wanted}" matches ${matches.length} entries (${matches.map((m) => m.id.slice(-6)).join(', ')})`,
+        );
+      });
     }
 
     const count = await approveEntries(ids);
     return text(`approved ${count} entr${count === 1 ? 'y' : 'ies'}`);
+  },
+);
+
+server.registerTool(
+  'edit_entry',
+  {
+    title: 'Edit an entry before it is pushed',
+    description:
+      "Set or fix a draft or approved entry's note (a brief what-did-you-do, one or two sentences), activity, or minutes. Use after reconstruct_day to write the note an entry is missing, or to correct what inference produced. Refuses pushed entries — those rows already exist in the sheet.",
+    inputSchema: {
+      id: z.string().describe('Entry id — full or the last 6 characters, as shown by get_day.'),
+      note: z
+        .string()
+        .optional()
+        .describe('Brief description for the Notes column. Empty string clears it.'),
+      activity: z.string().optional().describe('One of the sheet activities.'),
+      minutes: z.number().int().positive().optional().describe('Duration in minutes.'),
+      day: z.string().optional().describe('YYYY-MM-DD.'),
+      taskId: z
+        .string()
+        .optional()
+        .describe('OpenProject work package id, or an empty string to detach the entry.'),
+    },
+  },
+  async ({ id, note, activity, minutes, day, taskId }) => {
+    try {
+      if (day !== undefined && !validDay(day)) return fail(`${day} is not a YYYY-MM-DD day`);
+
+      const all = await listEntries({});
+      const exact = all.find((e) => e.id === id);
+      let found = exact;
+      if (!found) {
+        // A short id must resolve unambiguously — grabbing the first suffix
+        // match would silently edit the wrong entry.
+        const matches = all.filter((e) => e.id.endsWith(id));
+        if (matches.length > 1) {
+          return fail(
+            `"${id}" matches ${matches.length} entries (${matches.map((m) => m.id.slice(-6)).join(', ')})`,
+          );
+        }
+        found = matches[0];
+      }
+      if (!found) return fail(`no entry matching "${id}"`);
+
+      const patch: Parameters<typeof updateEntry>[1] = {};
+      if (note !== undefined) patch.description = note;
+      if (activity !== undefined) {
+        if (!ACTIVITIES.includes(activity as Activity)) {
+          return fail(`"${activity}" is not a sheet activity — choose one of: ${ACTIVITIES.join(', ')}`);
+        }
+        patch.activity = activity as Activity;
+      }
+      if (minutes !== undefined) {
+        patch.minutes = minutes;
+        // Keep the clock range consistent with the new length, anchored at the
+        // original start — otherwise Notes would contradict the Hours column.
+        const first = found.ranges[0];
+        if (first) patch.ranges = [{ startMin: first.startMin, endMin: first.startMin + minutes }];
+      }
+      if (day !== undefined) patch.day = day;
+      if (taskId !== undefined) {
+        if (taskId === '') {
+          // Empty string detaches — not every entry belongs to a task.
+          patch.taskId = null;
+        } else {
+          const problem = await checkTaskId(taskId);
+          if (problem !== null) return fail(problem);
+          patch.taskId = taskId;
+        }
+      }
+      const updated = await updateEntry(found.id, patch);
+      return text(`updated ${found.id.slice(-6)}:\n${describeEntries([updated])}`);
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
   },
 );
 
@@ -466,6 +758,7 @@ server.registerTool(
   },
   async ({ confirm, project, day, allowDuplicates }) => {
     try {
+      if (day !== undefined && !validDay(day)) return fail(`${day} is not a YYYY-MM-DD day`);
       const { sheetId } = requirePushConfig(cfg);
       const approved = await listEntries({
         status: 'approved',
@@ -486,9 +779,12 @@ server.registerTool(
         const p = resolveProject(projectKey);
         lines.push(`\n${p.name} → tab "${p.sheetTab}"`);
 
+        // The ceiling must count every hour already in the tab, not just what
+        // this machine pushed — the LP connector and other machines add rows too.
+        const { rows } = await readTab(sheetId, p.sheetTab);
         const issues = validateEntries(entries, {
           ...(p.contractHours !== undefined
-            ? { contractHoursRemaining: p.contractHours - (await pushedHours(projectKey)) }
+            ? { contractHoursRemaining: p.contractHours - summarize(rows).totalMinutes / 60 }
             : {}),
         });
         const errors = issues.filter((i) => i.severity === 'error');
@@ -514,25 +810,106 @@ server.registerTool(
           continue;
         }
 
-        const ids = entries.map((e) => e.id);
+        // Claim before the append, after every read. Two agents — and there are
+        // now at least two clients able to call this — must not both append the
+        // same approved batch to a sheet nobody here can delete from.
+        const claim = await claimEntriesForPush(entries.map((e) => e.id));
+        if (claim.claimed.length === 0) {
+          lines.push(`  another push already holds these ${entries.length} entr(ies) — skipped`);
+          continue;
+        }
+        if (claim.contended.length > 0) {
+          lines.push(
+            `  ${claim.contended.length} of ${entries.length} entr(ies) are held by another push — appending the other ${claim.claimed.length}`,
+          );
+        }
+
+        const pushing = claim.claimed;
+        const ids = pushing.map((e) => e.id);
         try {
           const result = await pushEntries({
             spreadsheetId: sheetId,
             tabTitle: p.sheetTab,
-            entries,
+            entries: pushing,
             ...(allowDuplicates ? { allowDuplicates: true } : {}),
           });
           await markPushed(ids, result.updatedRange);
+
+          // OpenProject write-through. The sheet is the ledger of record, so
+          // its append always comes first; the time entries are best-effort —
+          // a failure is reported but never fails the push, and PushLog
+          // records what landed so a retried push skips only what exists.
+          const opLines: string[] = [];
+          const openProjectTimeEntries: { entryId: string; timeEntryId: string }[] = [];
+          const withTasks = pushing.filter((e) => e.taskId !== undefined);
+          if (withTasks.length > 0) {
+            const op = cfg.openproject;
+            if (op.url === undefined || op.apiKey === undefined) {
+              opLines.push(
+                '  (OpenProject not configured — sheet rows appended, no OpenProject time entries)',
+              );
+            } else {
+              try {
+                // Retry idempotency: entries whose time entries PushLog
+                // already records were written by an earlier push, so they are
+                // skipped — creating them again would double-log the minutes.
+                const prior = await listOpenProjectTimeEntries(ids);
+                const todo = withTasks.filter((e) => !prior.has(e.id));
+                const skipped = withTasks.length - todo.length;
+                for (const e of todo) {
+                  if (e.taskId === undefined) continue;
+                  try {
+                    const te = await createTimeEntry({
+                      url: op.url,
+                      apiKey: op.apiKey,
+                      workPackage: e.taskId,
+                      minutes: e.minutes,
+                      spentOn: e.day,
+                      ...(e.description ? { comment: e.description } : {}),
+                    });
+                    openProjectTimeEntries.push({ entryId: e.id, timeEntryId: te.id });
+                  } catch (err) {
+                    // Only prior.has(e.id) skips — a failure means nothing was
+                    // written, so the retry must re-attempt the entry.
+                    const message = err instanceof Error ? err.message : String(err);
+                    opLines.push(
+                      `  OpenProject time entry for entry ${e.id.slice(-6)} failed: ${message} — sheet row appended; the retry will re-attempt it`,
+                    );
+                  }
+                }
+                opLines.push(
+                  todo.length === 0
+                    ? '  OpenProject: wrote 0 time entries'
+                    : `  OpenProject: wrote ${openProjectTimeEntries.length} time entr${
+                        openProjectTimeEntries.length === 1 ? 'y' : 'ies'
+                      }` + (skipped > 0 ? `, skipped ${skipped} (already written)` : ''),
+                );
+              } catch (err) {
+                // Defensive: nothing in the write-through may undo a sheet
+                // append that already succeeded.
+                const message = err instanceof Error ? err.message : String(err);
+                opLines.push(
+                  `  OpenProject write-through failed: ${message} — sheet rows appended`,
+                );
+              }
+            }
+          }
+
           await logPush({
             projectKey,
             sheetTab: p.sheetTab,
             entryIds: ids,
             minutes: result.minutes,
             ok: true,
+            openProjectTimeEntries,
           });
           lines.push(`  appended ${result.rowCount} row(s) at ${result.updatedRange}`);
+          lines.push(...opLines);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
+          // Release first: the entries stay approved, so the next attempt —
+          // possibly from the other client — has to be able to claim them.
+          await releasePushClaim(claim.owner);
           await logPush({
             projectKey,
             sheetTab: p.sheetTab,

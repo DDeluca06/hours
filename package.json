@@ -10,6 +10,7 @@
     "collect": "tsx --env-file-if-exists=.env apps/collector/src/index.ts",
     "mcp": "tsx --env-file-if-exists=.env apps/mcp-server/src/index.ts",
     "sheets:probe": "tsx --env-file-if-exists=.env connectors/google-sheets/src/probe.ts",
+    "sheets:auth": "tsx --env-file-if-exists=.env connectors/google-sheets/src/auth.ts",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",

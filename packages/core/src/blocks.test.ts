@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { groupSignalsByDay, inferBlocks, type Signal } from './blocks.js';
+import {
+  groupSignalsByDay,
+  inferBlocks,
+  mergeAdjacentSameActivity,
+  type InferredBlock,
+  type Signal,
+} from './blocks.js';
 import { DEFAULT_WORKDAY } from './workday.js';
 
 /** Build a signal at a local wall-clock time on 2026-08-12. */
@@ -88,8 +94,53 @@ describe('inferBlocks', () => {
   });
 });
 
-describe('groupSignalsByDay', () => {
-  it('buckets by local day, not UTC', () => {
+/** Build a block at 9:00–9:15; overrides position it as the next neighbour. */
+function block(over: Partial<InferredBlock> = {}): InferredBlock {
+  return {
+    projectKey: 'north10',
+    startMin: 9 * 60,
+    endMin: 9 * 60 + 15,
+    minutes: 15,
+    activity: 'Development',
+    confidence: 0.8,
+    reason: 'committed work',
+    signalIds: ['s:1'],
+    subjects: ['work'],
+    weight: 1,
+    ...over,
+  };
+}
+
+describe('mergeAdjacentSameActivity', () => {
+  // Next to a 9:00–9:15 block, a 9:15–9:30 block is contiguous.
+  const next = block({ startMin: 9 * 60 + 15, endMin: 9 * 60 + 30, signalIds: ['s:2'] });
+
+  it('keeps the task when both halves agree on it', () => {
+    const merged = mergeAdjacentSameActivity(
+      [block({ taskId: '136' }), { ...next, taskId: '136' }],
+      DEFAULT_WORKDAY,
+    );
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.taskId).toBe('136');
+  });
+
+  it('drops the task when the halves disagree', () => {
+    const merged = mergeAdjacentSameActivity(
+      [block({ taskId: '136' }), { ...next, taskId: '137' }],
+      DEFAULT_WORKDAY,
+    );
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.taskId).toBeUndefined();
+  });
+
+  it('drops the task when only one half names one', () => {
+    const merged = mergeAdjacentSameActivity([block({ taskId: '136' }), next], DEFAULT_WORKDAY);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.taskId).toBeUndefined();
+  });
+});
+
+describe('groupSignalsByDay', () => {  it('buckets by local day, not UTC', () => {
     // 11 PM local on 8/12 is already 8/13 in UTC — bucketing by UTC would move
     // a late-evening commit onto the wrong timesheet row.
     const late: Signal = {

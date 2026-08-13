@@ -107,13 +107,19 @@ export function quoteTab(title: string): string {
 }
 
 /**
- * The A1 range an append targets: the data columns only, from the header row
- * down. Bounding the right edge is what keeps `values.append` from treating a
- * pivot table as part of the table it should extend.
+ * The A1 range an append targets: a single row just past the last real data
+ * row, bounded on the right to the data columns.
+ *
+ * `values.append` with `INSERT_ROWS` appends after the LAST row that has any
+ * content within an open-ended range — and several tabs have stray cells
+ * parked far below the data (North10AI has 10 of them at rows 148-157), which
+ * would drag every push to the bottom of the sheet. Naming the exact insertion
+ * row instead makes the API insert there and push the parked cells down.
  */
-export function appendRange(layout: TabLayout): string {
+export function appendRange(layout: TabLayout, lastRealRow: number): string {
   const last = colLetter(layout.dataWidth - 1);
-  return `${quoteTab(layout.tabTitle)}!A${layout.headerRow}:${last}`;
+  const row = lastRealRow + 1;
+  return `${quoteTab(layout.tabTitle)}!A${row}:${last}${row}`;
 }
 
 /** Build the cell array for one row, in the tab's own column order. */

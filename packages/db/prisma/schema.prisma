@@ -30,6 +30,9 @@ model Signal {
   sourceId   String   @unique
   kind       String
   at         DateTime
+  /// Measured end of the work, when the source clocked it (agent harness turns).
+  /// Null for trailing-edge signals like commits, where duration is inferred.
+  until      DateTime?
   projectKey String?
   subject    String?
   /// JSON array of touched paths.
@@ -37,6 +40,9 @@ model Signal {
   /// Set once the signal has been folded into an entry, so re-running
   /// reconstruction does not double-count work already logged.
   consumedAt DateTime?
+  /// OpenProject work package ref, set by attribution in slice 3 — before
+  /// inference consumes the signal. Null until then.
+  taskId     String?
   createdAt  DateTime @default(now())
 
   @@index([at])
@@ -44,15 +50,27 @@ model Signal {
   @@index([consumedAt])
 }
 
-/// A running timer. At most one may be open at a time — enforced in code, since
-/// SQLite cannot express a partial unique index through Prisma.
+/// A running timer. At most one may be open at a time, and that is now a
+/// database constraint rather than a convention: the CLI, Claude Code's MCP
+/// server and OpenCode's each run their own process against this file, so a
+/// code-only check loses to a simultaneous start.
 model Timer {
   id         String   @id @default(cuid())
   projectKey String
   activity   String?
   note       String?
+  /// OpenProject work package id the running timer will log against ("136").
+  /// Null when no task was chosen at start.
+  taskId     String?
   startedAt  DateTime
   stoppedAt  DateTime?
+  /// "open" while running, null once stopped — always in step with stoppedAt.
+  ///
+  /// This is how SQLite expresses "at most one open timer" without a partial
+  /// index: NULLs are distinct in a unique index, so any number of stopped
+  /// timers coexist while a second concurrent start hits the constraint and
+  /// fails instead of creating a rival timer.
+  openKey    String?  @unique
 
   @@index([stoppedAt])
 }
@@ -79,12 +97,47 @@ model Entry {
   /// Set on a successful push; the A1 range the row landed in.
   sheetRange String?
   pushedAt   DateTime?
+  /// OpenProject work package id ("136") the minutes are logged against. A
+  /// plain string on purpose: no relation, not every entry belongs to a task.
+  taskId     String?
+  /// Push lease. Held from just before the sheet append until the push
+  /// resolves, so a second agent pushing the same approved entries at the same
+  /// moment skips them instead of appending the row twice — the sheet is
+  /// append-only and shared, so a duplicate there is someone else's problem to
+  /// find. Cleared on success and on failure; a lease older than
+  /// PUSH_LEASE_TTL_MS counts as abandoned by a crashed process.
+  pushLeaseAt DateTime?
+  /// Random token identifying the process holding the lease. Unique per
+  /// attempt, which is what lets a claimer read back exactly what it won.
+  pushLeaseBy String?
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
   @@index([day, person])
   @@index([status])
   @@index([projectKey, day])
+  @@index([taskId])
+  @@index([pushLeaseBy])
+}
+
+/// A cached OpenProject work package. Reconciliation point between the two
+/// ledgers: OpenProject's spentTime on one side, the local entries summed by
+/// taskId on the other. Never the only copy — the sheet is the ledger of
+/// record.
+model Task {
+  /// OpenProject work package id, e.g. "136".
+  id            String   @id
+  projectKey    String
+  subject       String
+  status        String?
+  /// OpenProject's spentTime, cached. Null until the first sync.
+  spentMinutes  Int?
+  /// estimatedTime cached for display only — budgets are out of scope.
+  estimatedMinutes Int?
+  /// Last successful sync; null until the first one.
+  syncedAt      DateTime?
+
+  @@index([projectKey])
 }
 
 /// One push attempt, successful or not. Kept forever: this is the answer to
@@ -99,6 +152,11 @@ model PushLog {
   error      String?
   /// JSON array of the entry ids included.
   entryIds   String
+  /// JSON array of {entryId, timeEntryId} — the OpenProject time entries this
+  /// push created. Null when the push wrote none. The write-through is
+  /// idempotent: a retried push skips entries whose OP time entry already
+  /// landed, and this column is what makes that possible.
+  openProjectTimeEntries String?
   createdAt  DateTime @default(now())
 
   @@index([createdAt])

@@ -11,7 +11,7 @@
 import { isActivity, toSheetRow, type Entry } from '@hours/core';
 import { getSheets } from './client.js';
 import { appendRange, buildRowCells, type TabLayout } from './layout.js';
-import { minutesFor, readTab, type ExistingRow } from './read.js';
+import { minutesFor, readTab, sameSheetDate, sheetDateWithYear, type ExistingRow } from './read.js';
 
 export interface AppendResult {
   /** The A1 range the API reports the rows landed in. */
@@ -40,10 +40,14 @@ export function findDuplicates(
   const out: DuplicateWarning[] = [];
   entries.forEach((e, i) => {
     const row = toSheetRow(e);
+    // Compared against the entry's full day, not the bare "M/D" that gets
+    // written: the tab holds rows from previous years, and 2/26/25 is not a
+    // duplicate of an entry for 2/26/26.
+    const day = sheetDateWithYear(e.day);
     const hit = existing.find(
       (r) =>
         r.person.toLowerCase() === e.person.toLowerCase() &&
-        r.dateText.startsWith(row.date) &&
+        sameSheetDate(r.dateText, day) &&
         r.activity.toLowerCase() === e.activity.toLowerCase() &&
         r.minutes === e.minutes,
     );
@@ -61,10 +65,17 @@ export interface PushOptions {
   spreadsheetId: string;
   tabTitle: string;
   entries: readonly Entry[];
-  /** Report what would be sent without touching the sheet. */
-  dryRun?: boolean;
   /** Append even when a matching row already exists. */
   allowDuplicates?: boolean;
+  /**
+   * A tab already read by the caller, reused instead of re-reading it.
+   *
+   * Only for previews: a caller that needs the tab for something else (the
+   * contract-hours ceiling) would otherwise pay a second round trip for the
+   * same bytes. `pushEntries` deliberately never passes this — the append
+   * target and the duplicate check must come from a fresh read.
+   */
+  tab?: { layout: TabLayout; rows: readonly ExistingRow[] };
 }
 
 export interface PushPreview {
@@ -74,6 +85,24 @@ export interface PushPreview {
   /** Minutes this person already has on the affected days. */
   existingByDay: Map<string, number>;
   minutes: number;
+  /** Highest sheet row holding real data — the append goes right below it. */
+  lastRealRow: number;
+}
+
+/**
+ * Where the real data ends: the last parsed row (one that has a date and a
+ * person). Stray cells parked below — dropdown leftovers, notes — do not count;
+ * an append must land right after the data, not after the sheet's last scribble.
+ */
+export function lastRealRow(rows: readonly ExistingRow[], headerRow: number): number {
+  let last = headerRow;
+  for (const r of rows) {
+    // A dated cell with no person is a dropdown leftover, not data — counting
+    // it would drag the append target below the sheet's scribbles.
+    if (!r.dateText || !r.person) continue;
+    if (r.sheetRow > last) last = r.sheetRow;
+  }
+  return last;
 }
 
 /** Build exactly what would be appended, without appending it. */
@@ -88,15 +117,17 @@ export async function previewPush(opts: PushOptions): Promise<PushPreview> {
     if (e.minutes <= 0) throw new Error(`refusing to push a ${e.minutes}-minute row`);
   }
 
-  const { layout, rows } = await readTab(opts.spreadsheetId, opts.tabTitle);
+  const { layout, rows } = opts.tab ?? (await readTab(opts.spreadsheetId, opts.tabTitle));
   const cells = opts.entries.map((e) => buildRowCells(layout, toSheetRow(e)));
   const duplicates = findDuplicates(opts.entries, rows);
 
   const existingByDay = new Map<string, number>();
   for (const e of opts.entries) {
+    // Keyed by the displayed "M/D" but queried with the year, same reason as
+    // the duplicate check above.
     const date = toSheetRow(e).date;
     if (!existingByDay.has(date)) {
-      existingByDay.set(date, minutesFor(rows, e.person, date));
+      existingByDay.set(date, minutesFor(rows, e.person, sheetDateWithYear(e.day)));
     }
   }
 
@@ -106,6 +137,7 @@ export async function previewPush(opts: PushOptions): Promise<PushPreview> {
     duplicates,
     existingByDay,
     minutes: opts.entries.reduce((s, e) => s + e.minutes, 0),
+    lastRealRow: lastRealRow(rows, layout.headerRow),
   };
 }
 
@@ -118,7 +150,15 @@ export async function previewPush(opts: PushOptions): Promise<PushPreview> {
  * pivot tables can sum, not as text.
  */
 export async function pushEntries(opts: PushOptions): Promise<AppendResult> {
-  const preview = await previewPush(opts);
+  // `tab` is dropped on purpose: a preview taken before the operator confirmed
+  // may be minutes old, and both the append row and the duplicate check have to
+  // reflect what is in the sheet at the moment of the write.
+  const preview = await previewPush({
+    spreadsheetId: opts.spreadsheetId,
+    tabTitle: opts.tabTitle,
+    entries: opts.entries,
+    ...(opts.allowDuplicates !== undefined ? { allowDuplicates: opts.allowDuplicates } : {}),
+  });
 
   if (preview.duplicates.length > 0 && !opts.allowDuplicates) {
     throw new Error(
@@ -128,11 +168,7 @@ export async function pushEntries(opts: PushOptions): Promise<AppendResult> {
     );
   }
 
-  const range = appendRange(preview.layout);
-
-  if (opts.dryRun) {
-    return { updatedRange: `${range} (dry run — nothing written)`, rowCount: 0, minutes: 0 };
-  }
+  const range = appendRange(preview.layout, preview.lastRealRow);
 
   const res = await getSheets().spreadsheets.values.append({
     spreadsheetId: opts.spreadsheetId,

@@ -19,6 +19,8 @@ import {
   cmdStart,
   cmdStatus,
   cmdStop,
+  cmdTask,
+  cmdTasks,
   cmdUnapprove,
 } from './commands.js';
 import { bold, dim } from './format.js';
@@ -29,21 +31,24 @@ ${bold('during the day')}
   hours start <project> [activity]     start a timer  (-p/-a also work)
   hours stop [activity] [--note "..."] stop it and save a draft entry
   hours cancel                         throw the running timer away
-  hours log <duration> <activity> -p <project> [-d <day>] [--note "..."]
+  hours log <duration> <activity> -p <project> [-d <day>] [--note "..."] [--task <id>]
                                        log time you already spent
   hours status                         timer, today's entries, uncounted signals
 
 ${bold('at 3 PM')}
-  hours collect [--days 3]             sweep git + Claude sessions into signals
+  hours collect [--days 3]             sweep git, agent harnesses, editor saves
   hours reconstruct [day] [--dry-run]  turn today's signals into draft entries
   hours review [--day <day>] [--all]   see drafts with the reasoning behind them
   hours edit <id> [--minutes 90] [--activity dev] [--note "..."] [--day today]
   hours drop <id>                      delete a draft
   hours approve <id...> | --day <day> | --all
+                       [--no-prompt]   approve without asking for missing notes
   hours unapprove <id...>              send approved entries back to draft
   hours push [--project <k>] [--day <d>] [--dry-run] [--yes]
 
 ${bold('looking around')}
+  hours task <id> [--refresh]          what a task has on it, both ledgers
+  hours tasks [--project <key>]        cached tasks with hours attached
   hours projects                       registry, watched repos, pushed totals
   hours sheet <project>                what the tab already says
 
@@ -70,6 +75,8 @@ const COMMANDS: Record<string, Handler> = {
   unapprove: cmdUnapprove,
   push: cmdPush,
   sheet: cmdSheet,
+  task: cmdTask,
+  tasks: cmdTasks,
   projects: async () => cmdProjects(),
 };
 

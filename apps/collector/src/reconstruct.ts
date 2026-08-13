@@ -13,13 +13,15 @@
 
 import { loadConfig } from '@hours/config';
 import {
+  agreeOnTask,
   entryFromBlock,
   inferBlocks,
   localDayKey,
+  signalTaskRef,
   type Entry,
   type InferredBlock,
 } from '@hours/core';
-import { consumeSignals, createEntries, loadSignals, type StoredEntry } from '@hours/lib-db';
+import { consumeSignals, createEntries, getTask, loadSignals, type StoredEntry } from '@hours/lib-db';
 
 export interface ReconstructResult {
   day: string;
@@ -51,6 +53,32 @@ export async function reconstruct(opts: ReconstructOptions = {}): Promise<Recons
     policy: cfg.workday,
     allowOutsideWorkday: cfg.allowOutsideWorkday,
   });
+
+  // Task attribution: a block carries a task only when its signals *agree* on
+  // one ref AND the cache has seen that task. The parsing is pure (taskrefs.ts)
+  // and the cache lives here, so this step is the seam between them. It runs
+  // even in dryRun — reporting what *would* be attributed is the point of the
+  // dry run — and it adds no signals and consumes none.
+  const bySourceId = new Map(signals.map((s) => [s.sourceId, s]));
+  for (const b of blocks) {
+    // A signal missing from the map (it was filtered between load and here)
+    // votes null, which never breaks consensus toward a task.
+    const refs = b.signalIds.map((id) => signalTaskRef(bySourceId.get(id) ?? { kind: '' }));
+    const candidate = agreeOnTask(refs);
+    if (candidate === null) continue;
+
+    const cached = await getTask(candidate);
+    if (cached) {
+      b.taskId = candidate;
+    } else {
+      // The entry is still created for the project — project attribution is
+      // separate, only the task link waits — and the ref is not lost: it lands
+      // in the reason so the reviewer sees why there is no task. The sweep
+      // refreshes the cache every 10 minutes, so a missing task resolves on
+      // the next run.
+      b.reason = `${b.reason}; task #${candidate} ref seen but not cached yet (sweep will sync it)`;
+    }
+  }
 
   const attributed: InferredBlock[] = [];
   const unattributed: InferredBlock[] = [];

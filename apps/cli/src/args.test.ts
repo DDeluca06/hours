@@ -29,6 +29,21 @@ describe('parseArgs', () => {
     expect(flagBool(a.flags, 'allow-duplicates')).toBe(true);
   });
 
+  // A known boolean must not eat the id after it: `approve --no-prompt <id>`
+  // used to set no-prompt="<id>", so the prompt still ran and targetsFor threw
+  // for want of an id.
+  it('does not let a boolean flag swallow the following positional', () => {
+    const a = parseArgs(['approve', '--no-prompt', '1a2b3c']);
+    expect(flagBool(a.flags, 'no-prompt')).toBe(true);
+    expect(a.positionals).toEqual(['1a2b3c']);
+  });
+
+  it('still takes a value for flags that have one', () => {
+    const a = parseArgs(['push', '--project', 'lp', '--yes']);
+    expect(flagString(a.flags, 'project')).toBe('lp');
+    expect(flagBool(a.flags, 'yes')).toBe(true);
+  });
+
   it('defaults to help with no argv', () => {
     expect(parseArgs([]).command).toBe('help');
   });

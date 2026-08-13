@@ -11,8 +11,22 @@
 // which is everything needed: `cwd` maps to a project through the registry, so
 // the slug encoding is never parsed.
 //
+// A turn is read as a *span*, not a point. The harness does not write a duration
+// field anywhere, but it timestamps every line, so a prompt's real end is the
+// last line the harness wrote before the next prompt — assistant output, tool
+// results, subagent chatter. That converts a 25-minute autonomous run off one
+// prompt from a single zero-width heartbeat (which the lead-in guess then
+// reported as a flat 20 minutes regardless) into measured time.
+//
+// Only genuine prompts become signals. Tool-result lines are also `type: "user"`
+// and were previously counted too, which over-weighted tool-heavy work by more
+// than an order of magnitude — a real day here is ~644 tool results against ~24
+// typed prompts, so a single afternoon of agent work outvoted every commit in the
+// apportionment. One signal per prompt, spanning the turn, says the same thing
+// without the distortion.
+//
 // Read as a line stream rather than parsed whole — these files reach tens of
-// megabytes, and only the user turns matter.
+// megabytes, and only the turn boundaries matter.
 // ---------------------------------------------------------------------------
 
 import { createReadStream } from 'node:fs';
@@ -20,7 +34,12 @@ import { readdir, stat } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { projectForPath, type ProjectDef, type Signal } from '@hours/core';
+import {
+  DEFAULT_MAX_SPAN_MIN,
+  projectForPath,
+  type ProjectDef,
+  type Signal,
+} from '@hours/core';
 
 export const SESSIONS_ROOT = join(homedir(), '.claude', 'projects');
 
@@ -33,6 +52,8 @@ interface TranscriptLine {
   timestamp?: string;
   cwd?: string;
   gitBranch?: string;
+  /** Present on tool-result lines, which are also `type: "user"`. */
+  toolUseResult?: unknown;
   message?: { role?: string; content?: unknown };
 }
 
@@ -68,14 +89,38 @@ export function summarizePrompt(text: string, max = 120): string {
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
 }
 
+/** A line that starts a turn: something a person (or the harness) submitted. */
+function isPrompt(d: TranscriptLine): boolean {
+  return (
+    d.type === 'user' &&
+    !d.isMeta &&
+    !d.isSidechain &&
+    // Tool results ride in on `type: "user"` too. They are the *middle* of a
+    // turn, so they extend the current span instead of starting a new one.
+    d.toolUseResult === undefined &&
+    !!d.timestamp &&
+    !!d.uuid &&
+    !!d.cwd
+  );
+}
+
 async function collectFromFile(
   filePath: string,
   since: Date,
   projects: readonly ProjectDef[],
+  maxSpanMin: number,
 ): Promise<Signal[]> {
   const signals: Signal[] = [];
   const stream = createReadStream(filePath, { encoding: 'utf-8' });
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
+
+  // The turn currently being measured. Its span grows with every harness line
+  // that follows, and closes when the next prompt arrives or the file ends.
+  let open: Signal | null = null;
+  const close = (): void => {
+    if (open) signals.push(open);
+    open = null;
+  };
 
   try {
     for await (const line of lines) {
@@ -87,26 +132,39 @@ async function collectFromFile(
         // A transcript being appended to right now can have a torn last line.
         continue;
       }
+      if (!d.timestamp) continue;
+      const stamp = new Date(d.timestamp);
+      if (Number.isNaN(stamp.getTime())) continue;
 
-      if (d.type !== 'user' || d.isMeta || d.isSidechain) continue;
-      if (!d.timestamp || !d.uuid || !d.cwd) continue;
+      if (isPrompt(d)) {
+        close();
+        // Prompts older than the window are still parsed — a turn that began
+        // before `since` and is still running would otherwise have its later
+        // lines misattributed to whatever prompt came next.
+        if (stamp < since) continue;
 
-      const at = new Date(d.timestamp);
-      if (Number.isNaN(at.getTime()) || at < since) continue;
+        const project = projectForPath(d.cwd as string, projects);
+        const subject = summarizePrompt(turnText(d.message?.content));
+        open = {
+          sourceId: `claude:${d.sessionId ?? 'unknown'}:${d.uuid as string}`,
+          kind: 'claude_session',
+          at: stamp,
+          // Unattributed rather than guessed: a session run outside a watched
+          // repo is real work whose project only you can name.
+          projectKey: project?.key ?? null,
+          ...(subject ? { subject } : {}),
+        };
+        continue;
+      }
 
-      const project = projectForPath(d.cwd, projects);
-      const subject = summarizePrompt(turnText(d.message?.content));
-
-      signals.push({
-        sourceId: `claude:${d.sessionId ?? 'unknown'}:${d.uuid}`,
-        kind: 'claude_session',
-        at,
-        // Unattributed rather than guessed: a session run outside a watched repo
-        // is real work whose project only you can name.
-        projectKey: project?.key ?? null,
-        ...(subject ? { subject } : {}),
-      });
+      // Any other timestamped line — assistant output, tool result, sidechain
+      // turn from a subagent — is proof the turn was still running.
+      if (open && stamp > open.at) {
+        const capped = Math.min(stamp.getTime(), open.at.getTime() + maxSpanMin * 60_000);
+        if (!open.until || capped > open.until.getTime()) open.until = new Date(capped);
+      }
     }
+    close();
   } finally {
     lines.close();
     stream.destroy();
@@ -120,6 +178,8 @@ export interface CollectSessionsOptions {
   projects: readonly ProjectDef[];
   /** Override the transcript root. Tests only. */
   root?: string;
+  /** Cap on a single turn's measured span. Defaults to `DEFAULT_MAX_SPAN_MIN`. */
+  maxSpanMin?: number;
 }
 
 /**
@@ -130,6 +190,7 @@ export interface CollectSessionsOptions {
  */
 export async function collectSessionSignals(opts: CollectSessionsOptions): Promise<Signal[]> {
   const root = opts.root ?? SESSIONS_ROOT;
+  const maxSpanMin = opts.maxSpanMin ?? DEFAULT_MAX_SPAN_MIN;
 
   let slugs: string[];
   try {
@@ -154,7 +215,7 @@ export async function collectSessionSignals(opts: CollectSessionsOptions): Promi
       try {
         const info = await stat(path);
         if (info.mtime < opts.since) continue;
-        out.push(...(await collectFromFile(path, opts.since, opts.projects)));
+        out.push(...(await collectFromFile(path, opts.since, opts.projects, maxSpanMin)));
       } catch {
         continue;
       }

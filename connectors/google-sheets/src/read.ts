@@ -123,12 +123,41 @@ export function minutesFor(
  * Compare two Date cells tolerantly.
  *
  * The sheet holds both "2/26" and "2/26/26" for the same day, so a naive string
- * comparison would report a day as un-logged when it isn't.
+ * comparison would report a day as un-logged when it isn't. Month and day must
+ * always agree; the year is only compared when *both* cells carry one — an
+ * undated year cannot disagree with anything, but "2/26/25" and "2/26/26" are
+ * different days and must not collide.
  */
 export function sameSheetDate(a: string, b: string): boolean {
-  const parse = (s: string) => {
-    const m = /^(\d{1,2})\/(\d{1,2})/.exec(s.trim());
-    return m ? `${Number(m[1])}/${Number(m[2])}` : s.trim();
-  };
-  return parse(a) === parse(b);
+  const pa = parseSheetDate(a);
+  const pb = parseSheetDate(b);
+  if (pa === null || pb === null) return a.trim() === b.trim();
+  if (pa.month !== pb.month || pa.day !== pb.day) return false;
+  if (pa.year === null || pb.year === null) return true;
+  return pa.year === pb.year;
+}
+
+/**
+ * A YYYY-MM-DD entry day as a year-carrying sheet date, "2026-02-26" → "2/26/2026".
+ *
+ * The sheet itself is written as bare "M/D" — that is the tab's convention and
+ * `formatSheetDate` keeps it — but a *comparison* against existing rows has to
+ * know the year, or a row logged on 2/26 last year matches an entry for 2/26
+ * this year. Use this on the entry side of `sameSheetDate`, never for a write.
+ */
+export function sheetDateWithYear(day: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day.trim());
+  if (!m) return day.trim();
+  return `${Number(m[2])}/${Number(m[3])}/${m[1]}`;
+}
+
+/** "2/26", "2/26/26", "2/26/2026" → parts, with a 2-digit year expanded. */
+function parseSheetDate(s: string): { month: number; day: number; year: number | null } | null {
+  // \d{4} before \d{2}: the pattern is unanchored, so the two-digit branch
+  // would otherwise match "20" out of "2026" and read the year as 2020.
+  const m = /^(\d{1,2})\/(\d{1,2})(?:\/(\d{4}|\d{2}))?/.exec(s.trim());
+  if (!m) return null;
+  const raw = m[3];
+  const year = raw === undefined ? null : raw.length === 2 ? 2000 + Number(raw) : Number(raw);
+  return { month: Number(m[1]), day: Number(m[2]), year };
 }

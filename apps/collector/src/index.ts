@@ -29,7 +29,11 @@ async function runOnce(lookbackMs: number): Promise<void> {
       .filter(([, n]) => n > 0)
       .map(([k, n]) => `${k}=${n}`)
       .join(' ');
-    log(`swept ${result.scanned} signals, ${result.recorded} new${detail ? ` (${detail})` : ''}`);
+    const tasks = result.tasksSynced > 0 ? `, ${result.tasksSynced} tasks cached` : '';
+    const spans = result.spansAdvanced > 0 ? `, ${result.spansAdvanced} spans extended` : '';
+    log(
+      `swept ${result.scanned} signals, ${result.recorded} new${detail ? ` (${detail})` : ''}${spans}${tasks}`,
+    );
     for (const w of result.warnings) log(`  warning: ${w}`);
   } catch (err) {
     // Never exit on a failed sweep — a transient git lock or a mid-write

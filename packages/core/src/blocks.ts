@@ -10,6 +10,13 @@
 // 10:45 records work that happened before 10:45, not at it. So a block's end is
 // its last signal, and its start is its first signal minus a lead-in — without
 // that, a day of six commits infers six zero-length blocks and reports 0 hours.
+//
+// Signals from an agent harness are the exception: they carry `until`, a real
+// clocked end, so their duration is measured rather than guessed. A run that
+// opens with a measured span gets no lead-in, and idle gaps are measured from a
+// signal's end rather than its start. Everything downstream — apportionment,
+// clipping, the workday clamp — is unchanged, which is why inferred time still
+// cannot exceed the wall clock.
 // ---------------------------------------------------------------------------
 
 import { mergeRanges } from './duration.js';
@@ -33,6 +40,7 @@ export type SignalKind =
   | 'git_branch'
   | 'file_edit'
   | 'claude_session'
+  | 'opencode_session'
   | 'calendar'
   | 'manual';
 
@@ -47,6 +55,27 @@ export interface Signal {
   subject?: string;
   /** Repo-relative paths this signal touched. */
   paths?: string[];
+  /**
+   * Observed end of the work this signal describes — a *measured* span rather
+   * than a point.
+   *
+   * Most signals are trailing edges with no known duration (a commit says
+   * nothing about when you started), and for those this stays absent and the
+   * lead-in guess applies. An agent harness is the exception: it records when a
+   * turn began and when it finished, so that stretch is known rather than
+   * inferred. Where it is known, we use it and drop the guess.
+   */
+  until?: Date;
+}
+
+/** True when the harness told us how long this signal's work actually took. */
+export function isMeasured(s: Pick<Signal, 'at' | 'until'>): boolean {
+  return s.until !== undefined && s.until.getTime() > s.at.getTime();
+}
+
+/** The observed end of a signal — its measured end, or its instant. */
+export function signalEnd(s: Pick<Signal, 'at' | 'until'>): Date {
+  return isMeasured(s) ? (s.until as Date) : s.at;
 }
 
 export interface InferredBlock {
@@ -70,6 +99,12 @@ export interface InferredBlock {
    * about what you were doing than twenty session turns do.
    */
   weight: number;
+  /**
+   * OpenProject task id ("136") the block's signals agreed on. Absent when the
+   * signals disagreed, the ref was never seen, or the cache has not synced it
+   * yet. Set by the collector after inference, never by the parser alone.
+   */
+  taskId?: string;
 }
 
 /**
@@ -86,7 +121,55 @@ const KIND_WEIGHT: Record<SignalKind, number> = {
   git_branch: 2,
   file_edit: 1,
   claude_session: 1,
+  opencode_session: 1,
 };
+
+/** Weight floor for a measured span — see `signalWeight`. */
+const MEASURED_WEIGHT = 2;
+
+/**
+ * Longest span a single harness turn may claim, in minutes.
+ *
+ * A turn's span is bounded by the model's own runtime in the normal case, but a
+ * tool call parked on a permission prompt while you go to lunch is stamped as one
+ * continuous turn. Clamping at two hours keeps that from billing lunch. It lives
+ * here, with the other inference policy, because every harness reader needs the
+ * same number and none of them should invent its own.
+ */
+export const DEFAULT_MAX_SPAN_MIN = 120;
+
+/**
+ * How much one signal counts toward its block's claim on a window.
+ *
+ * A measured span outweighs a bare heartbeat: it is evidence of *duration*, not
+ * just of presence, so when two activities fight over the same window the one
+ * whose time the harness actually clocked should win. It stays below a commit's
+ * 4 — wall-clock in a session proves the machine was busy, a commit proves you
+ * decided something.
+ */
+export function signalWeight(s: Pick<Signal, 'kind' | 'at' | 'until'>): number {
+  const base = KIND_WEIGHT[s.kind] ?? 1;
+  return isMeasured(s) ? Math.max(base, MEASURED_WEIGHT) : base;
+}
+
+/**
+ * A signal's end as minutes from midnight, saturating at the day boundary.
+ *
+ * A span that crosses local midnight is clipped at 23:59 rather than wrapping to
+ * a small number — blocks are inferred one calendar day at a time
+ * (`groupSignalsByDay`), so the minutes past midnight belong to the next day's
+ * pass. Wrapping instead would make `endMin` land *before* `startMin` and the
+ * block would be silently dropped.
+ */
+function endMinutes(s: Signal): number {
+  if (!isMeasured(s)) return minutesFromMidnight(s.at);
+  const end = s.until as Date;
+  const sameDay =
+    end.getFullYear() === s.at.getFullYear() &&
+    end.getMonth() === s.at.getMonth() &&
+    end.getDate() === s.at.getDate();
+  return sameDay ? minutesFromMidnight(end) : 24 * 60 - 1;
+}
 
 export interface InferOptions {
   policy?: WorkdayPolicy;
@@ -133,7 +216,11 @@ export function inferBlocks(signals: readonly Signal[], opts: InferOptions = {})
     let current: Signal[] = [];
     for (const s of stream) {
       const prev = current[current.length - 1];
-      const gap = prev ? (s.at.getTime() - prev.at.getTime()) / 60_000 : Infinity;
+      // Measured from the previous signal's *end*, not its instant. A 40-minute
+      // agent turn followed by a commit five minutes later is one stretch of
+      // work; measuring the gap from the turn's start would call it 45 minutes
+      // idle and split the block in two.
+      const gap = prev ? (s.at.getTime() - signalEnd(prev).getTime()) / 60_000 : Infinity;
       if (current.length > 0 && gap <= policy.gapMin) {
         current.push(s);
       } else {
@@ -150,8 +237,14 @@ export function inferBlocks(signals: readonly Signal[], opts: InferOptions = {})
     const last = run[run.length - 1];
     if (!first || !last) continue;
 
-    const rawStart = minutesFromMidnight(first.at) - leadIn;
-    const rawEnd = minutesFromMidnight(last.at);
+    // The lead-in exists to compensate for not knowing when work began. When the
+    // run opens with a measured span, we *do* know — the harness stamped it — so
+    // guessing 20 minutes on top of a known start would invent time.
+    const measuredStart = isMeasured(first);
+    const rawStart = minutesFromMidnight(first.at) - (measuredStart ? 0 : leadIn);
+    // `last` is the latest by start time, but a span that began earlier can end
+    // later, so the run's end is the max over every signal's observed end.
+    const rawEnd = Math.max(...run.map(endMinutes));
 
     const clamped = clampToWorkday(rawStart, Math.max(rawEnd, rawStart + 1), policy, allowOutside);
     if (!clamped) continue;
@@ -169,6 +262,14 @@ export function inferBlocks(signals: readonly Signal[], opts: InferOptions = {})
     const subjects = [...new Set(run.map((s) => s.subject).filter((s): s is string => !!s))];
     const guess = classifyRun(subjects, paths);
 
+    // Say so in the reason: a reviewer looking at 95 minutes needs to know
+    // whether that came off a clock or off the lead-in heuristic.
+    const measuredCount = run.filter((s) => isMeasured(s)).length;
+    const reason =
+      measuredCount > 0
+        ? `${guess.reason}; ${measuredCount} measured harness span${measuredCount === 1 ? '' : 's'}${measuredStart ? ', no lead-in guess' : ''}`
+        : guess.reason;
+
     blocks.push({
       projectKey: first.projectKey,
       startMin,
@@ -176,10 +277,10 @@ export function inferBlocks(signals: readonly Signal[], opts: InferOptions = {})
       minutes,
       activity: guess.activity,
       confidence: guess.confidence,
-      reason: guess.reason,
+      reason,
       signalIds: run.map((s) => s.sourceId),
       subjects,
-      weight: run.reduce((sum, s) => sum + (KIND_WEIGHT[s.kind] ?? 1), 0),
+      weight: run.reduce((sum, s) => sum + signalWeight(s), 0),
     });
   }
 
@@ -306,6 +407,7 @@ interface Share {
   earliest: number;
   signalIds: string[];
   subjects: string[];
+  taskId?: string;
   granules: number;
 }
 
@@ -335,6 +437,11 @@ function apportion(cluster: readonly InferredBlock[], policy: WorkdayPolicy): In
       existing.earliest = Math.min(existing.earliest, b.startMin);
       existing.signalIds.push(...b.signalIds);
       existing.subjects = [...new Set([...existing.subjects, ...b.subjects])];
+      // Same rule — and the same dormancy — as mergeAdjacentSameActivity: a
+      // share keeps its task only while every block folded into it names the
+      // same one. Blocks carry no taskId this early in the current pipeline;
+      // the rule exists for callers of the exported helper.
+      if (existing.taskId !== b.taskId) delete existing.taskId;
     } else {
       shares.set(key, {
         projectKey: b.projectKey,
@@ -345,6 +452,7 @@ function apportion(cluster: readonly InferredBlock[], policy: WorkdayPolicy): In
         earliest: b.startMin,
         signalIds: [...b.signalIds],
         subjects: [...b.subjects],
+        ...(b.taskId !== undefined ? { taskId: b.taskId } : {}),
         granules: 0,
       });
     }
@@ -418,6 +526,7 @@ function apportion(cluster: readonly InferredBlock[], policy: WorkdayPolicy): In
       signalIds: share.signalIds,
       subjects: share.subjects,
       weight: share.weight,
+      ...(share.taskId !== undefined ? { taskId: share.taskId } : {}),
     });
     cursor += minutes;
   }
@@ -457,7 +566,7 @@ export function classifyRun(
  * any honest timesheet, even though the gap rule split them. Merging keeps the
  * sheet readable — the team logs a handful of rows a day, not twenty.
  */
-function mergeAdjacentSameActivity(
+export function mergeAdjacentSameActivity(
   blocks: readonly InferredBlock[],
   policy: WorkdayPolicy,
 ): InferredBlock[] {
@@ -477,6 +586,16 @@ function mergeAdjacentSameActivity(
       last.subjects = [...new Set([...last.subjects, ...b.subjects])];
       last.confidence = Math.max(last.confidence, b.confidence);
       last.weight += b.weight;
+      // A merged block must not carry a task its halves disagree on — the
+      // merged signals no longer name one task, so the task link would be a
+      // guess. The task survives only while both halves name the same one.
+      //
+      // Dormant in the current pipeline: reconstruct assigns taskId *after*
+      // inferBlocks returns, so blocks reaching here carry none, and consensus
+      // is enforced by agreeOnTask instead. Kept because this function is
+      // exported — a caller that pre-assigns tasks gets the rule, not a silent
+      // wrong link.
+      if (last.taskId !== b.taskId) delete last.taskId;
     } else {
       out.push({ ...b, signalIds: [...b.signalIds], subjects: [...b.subjects] });
     }

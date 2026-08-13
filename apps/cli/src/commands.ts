@@ -8,8 +8,9 @@
 // ---------------------------------------------------------------------------
 
 import { createInterface } from 'node:readline/promises';
-import { loadConfig, requirePushConfig } from '@hours/config';
+import { loadConfig, requirePushConfig, type HoursConfig } from '@hours/config';
 import {
+  collectNotes,
   formatMinutesShort,
   localDayKey,
   projectByKey,
@@ -22,26 +23,35 @@ import {
 } from '@hours/core';
 import {
   approveEntries,
+  claimEntriesForPush,
   createEntries,
   currentTimer,
   cancelTimer,
   deleteEntry,
   getEntry,
+  getTask,
   listEntries,
+  listOpenProjectTimeEntries,
+  listTaskMinutes,
+  listTasks,
   loadSignals,
   logPush,
   markPushed,
   pushedHours,
+  releasePushClaim,
   startTimer,
   stopTimer,
   unapproveEntries,
   updateEntry,
+  upsertTasks,
   type StoredEntry,
+  type TaskMinutes,
 } from '@hours/lib-db';
 import { reconstruct, sweep } from '@hours/collector';
 import { previewPush, pushEntries, readTab, summarize } from '@hours/connector-google-sheets';
+import { createTimeEntry, getWorkPackage, listTimeEntries } from '@hours/connector-openproject';
 import { flagBool, flagString, parseDayArg, parseMinutesArg, type ParsedArgs } from './args.js';
-import { bold, cyan, dim, green, red, renderEntries, renderTotals, shortId, yellow } from './format.js';
+import { bold, cyan, dim, green, red, renderEntries, renderTable, renderTotals, shortId, yellow } from './format.js';
 
 function requireProject(key: string | undefined, cfg = loadConfig()): ProjectDef {
   if (!key) {
@@ -67,6 +77,16 @@ function requireActivity(raw: string | undefined): Activity {
     );
   }
   return activity;
+}
+
+/**
+ * Read a task id from a CLI argument: a positive integer like "136", or null
+ * when absent or not one. Zero and negatives are never task ids.
+ */
+function taskIdFrom(raw: string | undefined): string | null {
+  if (!raw) return null;
+  if (!/^\d+$/.test(raw) || Number(raw) <= 0) return null;
+  return raw;
 }
 
 /** Resolve a short id suffix to a single entry, refusing on ambiguity. */
@@ -96,6 +116,31 @@ async function confirm(question: string, assumeYes: boolean): Promise<boolean> {
   }
 }
 
+/**
+ * The 3 PM habit: before approving, offer to write the brief "what did you
+ * do?" note on every entry that has none. Only runs on a real terminal —
+ * scripts and pipelines approve silently, and the MCP server goes through
+ * edit_entry instead. Enter skips, so a day of heavy work approves quickly.
+ */
+async function askMissingNotes(entries: readonly StoredEntry[]): Promise<void> {
+  if (!process.stdin.isTTY) return;
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const patches = await collectNotes(entries, async (e) => {
+      const answer = await rl.question(
+        `  note for ${shortId(e.id)} (${e.activity}, ${formatMinutesShort(e.minutes)})? [Enter to skip] `,
+      );
+      return answer;
+    });
+    for (const p of patches) {
+      await updateEntry(p.id, { description: p.description });
+    }
+    if (patches.length > 0) console.log(dim(`wrote ${patches.length} note${patches.length === 1 ? '' : 's'}`));
+  } finally {
+    rl.close();
+  }
+}
+
 // --- log ------------------------------------------------------------------
 
 export async function cmdLog(args: ParsedArgs): Promise<void> {
@@ -104,7 +149,7 @@ export async function cmdLog(args: ParsedArgs): Promise<void> {
 
   const minutes = durationRaw ? parseMinutesArg(durationRaw) : null;
   if (minutes === null) {
-    throw new Error('usage: hours log <duration> <activity> --project <key> [--day <day>] [--note "..."]');
+    throw new Error('usage: hours log <duration> <activity> --project <key> [--day <day>] [--note "..."] [--task <id>]');
   }
   if (minutes <= 0) throw new Error('duration must be positive');
 
@@ -127,6 +172,22 @@ export async function cmdLog(args: ParsedArgs): Promise<void> {
   };
   const note = flagString(args.flags, 'note');
   if (note) entry.description = note;
+
+  const taskRaw = flagString(args.flags, 'task');
+  if (taskRaw !== undefined) {
+    const taskId = taskIdFrom(taskRaw);
+    if (taskId === null) {
+      throw new Error(`"${taskRaw}" is not a task id — use a positive integer like "136"`);
+    }
+    // A ref to a task the cache has never seen is refused, not guessed — the
+    // attachment must not be invented for a task nothing ever synced.
+    if ((await getTask(taskId)) === null) {
+      throw new Error(
+        `task #${taskId} is not in the local cache — run \`hours task ${taskId} --refresh\` to cache it first, or wait for the next sweep`,
+      );
+    }
+    entry.taskId = taskId;
+  }
 
   const [created] = await createEntries([entry]);
   console.log(green('logged'), renderEntries(created ? [created] : []));
@@ -169,16 +230,19 @@ export async function cmdStop(args: ParsedArgs): Promise<void> {
     return;
   }
 
-  const stopped = await stopTimer();
-  if (!stopped) return;
-
-  const activityRaw = flagString(args.flags, 'activity') ?? args.positionals[0] ?? stopped.activity;
+  // Decide whether an activity exists BEFORE stopping: stopTimer finalizes the
+  // open timer, and an error thrown after that would leave the time unrecoverable.
+  const activityRaw = flagString(args.flags, 'activity') ?? args.positionals[0] ?? open.activity;
   if (!activityRaw) {
     throw new Error(
-      `the timer had no activity — re-run as \`hours stop <activity>\`. ${formatMinutesShort(stopped.minutes)} is preserved and will be waiting.`,
+      `the timer has no activity — re-run as \`hours stop <activity>\`. The timer is still running and that will log it.`,
     );
   }
   const activity = requireActivity(activityRaw);
+
+  const stopped = await stopTimer();
+  if (!stopped) return;
+
   const person = flagString(args.flags, 'person') ?? cfg.person;
   if (!person) throw new Error('HOURS_PERSON is not set and --person was not given');
 
@@ -189,12 +253,19 @@ export async function cmdStop(args: ParsedArgs): Promise<void> {
     projectKey: stopped.projectKey,
     minutes: stopped.minutes,
     activity,
+    // Not clamped at midnight: formatClock wraps, so a 23:00 timer stopped
+    // after 90 minutes reads "23:00 - 0:30", which is what happened. Clamping
+    // to 1440 rendered it as "23:00 - 0:00" — a range whose length contradicts
+    // the Hours column.
     ranges: [{ startMin, endMin: startMin + stopped.minutes }],
     status: 'draft',
     provenance: 'timer',
   };
   const note = flagString(args.flags, 'note') ?? stopped.note;
   if (note) entry.description = note;
+  // The timer carries its taskId forward, the same as the MCP stop — a task
+  // attachment belongs to the work, not to the surface the timer stopped from.
+  if (stopped.taskId) entry.taskId = stopped.taskId;
 
   const [created] = await createEntries([entry]);
   console.log(green(`stopped after ${formatMinutesShort(stopped.minutes)}`));
@@ -250,6 +321,14 @@ export async function cmdCollect(args: ParsedArgs): Promise<void> {
   for (const [source, n] of Object.entries(result.bySource)) {
     if (n > 0) console.log(dim(`  ${source}: ${n}`));
   }
+  // Also apart from the counts: these are signals seen on an earlier sweep whose
+  // turn was still running, now measured longer. Nothing new was observed.
+  if (result.spansAdvanced > 0) {
+    console.log(dim(`  measured spans extended: ${result.spansAdvanced}`));
+  }
+  // Reported apart from the signal counts above — cached tasks are not evidence
+  // of work, they are the registry the evidence gets attributed against.
+  if (result.tasksSynced > 0) console.log(dim(`  openproject tasks cached: ${result.tasksSynced}`));
   for (const w of result.warnings) console.log(yellow(`  warning: ${w}`));
 }
 
@@ -360,6 +439,9 @@ export async function cmdEdit(args: ParsedArgs): Promise<void> {
 
 export async function cmdApprove(args: ParsedArgs): Promise<void> {
   const targets = await targetsFor(args);
+  if (!flagBool(args.flags, 'no-prompt')) {
+    await askMissingNotes(targets);
+  }
   const count = await approveEntries(targets.map((t) => t.id));
   console.log(green(`approved ${count} entr${count === 1 ? 'y' : 'ies'}`));
   if (count < targets.length) {
@@ -398,6 +480,76 @@ async function targetsFor(args: ParsedArgs): Promise<StoredEntry[]> {
 
 // --- push -----------------------------------------------------------------
 
+/**
+ * Best-effort OpenProject write-through for one project batch, run only after
+ * the sheet append succeeded. Mirrors every task-ref'd entry as an OpenProject
+ * time entry for the same task, day, and minutes. Never throws — a per-entry
+ * failure is reported and the sheet push stands; the PushLog carries the
+ * created time-entry ids so a retried push skips what already landed.
+ */
+async function writeOpenProjectTimeEntries(
+  cfg: HoursConfig,
+  entries: readonly StoredEntry[],
+): Promise<{ entryId: string; timeEntryId: string }[]> {
+  const op = cfg.openproject;
+  if (!op.url || !op.apiKey) {
+    console.log(dim('  (OpenProject not configured — sheet rows appended, no OpenProject time entries)'));
+    return [];
+  }
+
+  const withTask = entries.filter((e): e is StoredEntry & { taskId: string } => e.taskId !== undefined);
+
+  // Reading the prior time entries is the one step here that can throw for a
+  // reason unrelated to OpenProject — a malformed openProjectTimeEntries blob
+  // in any earlier PushLog row, or a store error. It runs after the sheet
+  // append has already succeeded, so letting it escape would make cmdPush log
+  // a real push as failed. Degrade instead: without the prior set we cannot
+  // prove what already landed, so write nothing rather than risk double-logging.
+  let prior: ReadonlyMap<string, string>;
+  try {
+    prior = await listOpenProjectTimeEntries(entries.map((e) => e.id));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.log(
+      yellow(
+        `  OpenProject write-through skipped: could not read prior time entries (${message}) — sheet rows appended`,
+      ),
+    );
+    return [];
+  }
+
+  const todo = withTask.filter((e) => !prior.has(e.id));
+  const skipped = withTask.length - todo.length;
+
+  const written: { entryId: string; timeEntryId: string }[] = [];
+  for (const e of todo) {
+    try {
+      const te = await createTimeEntry({
+        url: op.url,
+        apiKey: op.apiKey,
+        workPackage: e.taskId,
+        minutes: e.minutes,
+        spentOn: e.day,
+        ...(e.description ? { comment: e.description } : {}),
+      });
+      written.push({ entryId: e.id, timeEntryId: te.id });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.log(
+        yellow(
+          `  OpenProject time entry for ${shortId(e.id)} failed: ${message} — sheet row appended; a retry will re-attempt it`,
+        ),
+      );
+    }
+  }
+
+  const parts = [`wrote ${written.length} time entr${written.length === 1 ? 'y' : 'ies'}`];
+  if (skipped > 0) parts.push(`skipped ${skipped} (already written)`);
+  console.log(dim(`  OpenProject: ${parts.join(', ')}`));
+
+  return written;
+}
+
 export async function cmdPush(args: ParsedArgs): Promise<void> {
   const cfg = loadConfig();
   const { sheetId } = requirePushConfig(cfg);
@@ -432,28 +584,37 @@ export async function cmdPush(args: ParsedArgs): Promise<void> {
     const project = requireProject(projectKey, cfg);
     console.log(`\n${bold(project.name)} → tab ${cyan(project.sheetTab)}`);
 
-    const issues = validateEntries(entries, {
-      ...(project.contractHours !== undefined
-        ? { contractHoursRemaining: project.contractHours - (await pushedHours(projectKey)) }
-        : {}),
-    });
-    const errors = issues.filter((i) => i.severity === 'error');
-    if (errors.length) {
-      for (const e of errors) console.log(red(`  error: ${e.message}`));
-      console.log(red('  refusing to push this project'));
-      continue;
-    }
-    for (const w of issues) console.log(yellow(`  warn: ${w.message}`));
-
+    // One try around every sheet read for this project. A tab with an
+    // unreadable header, a 403, or a dropped connection must cost this project
+    // and no other — before, the ceiling read sat outside and took the whole
+    // push down with it.
     let preview;
     try {
-      preview = await previewPush({ spreadsheetId: sheetId, tabTitle: project.sheetTab, entries });
+      const tab = await readTab(sheetId, project.sheetTab);
+      const used = summarize(tab.rows).totalMinutes / 60;
+      const issues = validateEntries(entries, {
+        ...(project.contractHours !== undefined
+          ? { contractHoursRemaining: project.contractHours - used }
+          : {}),
+      });
+      const errors = issues.filter((i) => i.severity === 'error');
+      if (errors.length) {
+        for (const e of errors) console.log(red(`  error: ${e.message}`));
+        console.log(red('  refusing to push this project'));
+        continue;
+      }
+      for (const w of issues) console.log(yellow(`  warn: ${w.message}`));
+
+      // The tab just read is handed to the preview so the ceiling check does
+      // not cost an extra round trip; the append re-reads it for itself.
+      preview = await previewPush({ spreadsheetId: sheetId, tabTitle: project.sheetTab, entries, tab });
     } catch (err) {
       console.log(red(`  ${err instanceof Error ? err.message : String(err)}`));
       continue;
     }
 
     console.log(dim(`  header row ${preview.layout.headerRow}, "${preview.layout.activityHeader}" column`));
+    console.log(dim(`  appends at row ${preview.lastRealRow + 1}, below the last logged row`));
     for (const e of entries) {
       const row = toSheetRow(e);
       console.log(`  ${row.date}  ${row.person}  ${row.hours}  ${row.activity}  ${dim(row.notes)}`);
@@ -479,25 +640,47 @@ export async function cmdPush(args: ParsedArgs): Promise<void> {
       continue;
     }
 
-    const ids = entries.map((e) => e.id);
+    // Claim the entries between the confirmation and the append. Everything
+    // above this line is a read; from here on the rows are ours alone, so a
+    // second agent pushing the same batch cannot append it twice.
+    const claim = await claimEntriesForPush(entries.map((e) => e.id));
+    if (claim.claimed.length === 0) {
+      console.log(yellow(`  another push already has these ${entries.length} entr(ies) — skipped`));
+      continue;
+    }
+    if (claim.contended.length > 0) {
+      console.log(
+        yellow(
+          `  ${claim.contended.length} of ${entries.length} entr(ies) are held by another push — appending the other ${claim.claimed.length}`,
+        ),
+      );
+    }
+
+    const pushing = claim.claimed;
+    const ids = pushing.map((e) => e.id);
     try {
       const result = await pushEntries({
         spreadsheetId: sheetId,
         tabTitle: project.sheetTab,
-        entries,
+        entries: pushing,
         allowDuplicates,
       });
       await markPushed(ids, result.updatedRange);
+      console.log(green(`  appended ${result.rowCount} row(s) at ${result.updatedRange}`));
+      const written = await writeOpenProjectTimeEntries(cfg, pushing);
       await logPush({
         projectKey,
         sheetTab: project.sheetTab,
         entryIds: ids,
         minutes: result.minutes,
         ok: true,
+        openProjectTimeEntries: written,
       });
-      console.log(green(`  appended ${result.rowCount} row(s) at ${result.updatedRange}`));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      // Hand the claim back before reporting: the entries stay approved, so a
+      // re-run — from here or from another agent — must be able to take them.
+      await releasePushClaim(claim.owner);
       await logPush({
         projectKey,
         sheetTab: project.sheetTab,
@@ -565,4 +748,185 @@ export async function cmdProjects(): Promise<void> {
     );
     for (const repo of p.repoPaths) console.log(dim(`    watching ${repo}`));
   }
+}
+
+// --- task hours -----------------------------------------------------------
+
+export async function cmdTask(args: ParsedArgs): Promise<void> {
+  const raw = args.positionals[0];
+  if (raw === undefined) throw new Error('usage: hours task <id> [--refresh]');
+  const id = taskIdFrom(raw);
+  if (id === null) {
+    throw new Error(`"${raw}" is not a task id — use a positive integer like "136"`);
+  }
+
+  const cfg = loadConfig();
+  const refresh = flagBool(args.flags, 'refresh');
+
+  let task = await getTask(id);
+  const op = cfg.openproject;
+  let note = '';
+  let warnNote = false;
+  let refreshed = false;
+  let opMinutes: number | null = null;
+  let opEntryCount = 0;
+
+  if (op.url === undefined || op.apiKey === undefined) {
+    if (task === null) {
+      throw new Error(
+        `task #${id} has no hours attached locally, and OpenProject is not configured ` +
+          '(OPENPROJECT_URL/OPENPROJECT_API_KEY) — nothing to report',
+      );
+    }
+    note = 'OpenProject not configured (OPENPROJECT_URL/OPENPROJECT_API_KEY) — cached only';
+  } else if (refresh || task === null) {
+    try {
+      const [wp, timeEntries] = await Promise.all([
+        getWorkPackage({ url: op.url, apiKey: op.apiKey, id }),
+        listTimeEntries({ url: op.url, apiKey: op.apiKey, workPackage: id }),
+      ]);
+
+      let projectKey = task?.projectKey ?? id;
+      if (task === null) {
+        // The registry maps hours keys → OpenProject identifiers, and that
+        // direction cannot be inverted from the work package alone. One
+        // mapped project is unambiguous; more than one would be a guess, so
+        // the task is cached under its raw id instead (slice 3 attribution
+        // refines this).
+        const mapped = Object.entries(op.projects ?? {});
+        if (mapped.length === 1) projectKey = mapped[0]?.[0] ?? id;
+        else if (mapped.length > 1) note = 'project unknown — cached under the raw id';
+      }
+
+      task =
+        (
+          await upsertTasks([
+            {
+              id,
+              projectKey,
+              subject: wp.subject,
+              ...(wp.status !== null ? { status: wp.status } : {}),
+              ...(wp.spentMinutes !== null ? { spentMinutes: wp.spentMinutes } : {}),
+              ...(wp.estimatedMinutes !== null ? { estimatedMinutes: wp.estimatedMinutes } : {}),
+            },
+          ])
+        )[0] ?? null;
+      refreshed = true;
+      opMinutes = timeEntries.totalMinutes;
+      opEntryCount = timeEntries.entries.length;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // A failed refresh still answers from the cache — but only when there
+      // is a cache to answer from.
+      if (task === null) throw new Error(message, { cause: err });
+      warnNote = true;
+      note = `OpenProject unreachable: ${message}`;
+    }
+  } else {
+    note = '(cached — pass --refresh to re-check OpenProject)';
+  }
+
+  if (task === null) {
+    throw new Error(`task #${id} is not in the local cache and could not be fetched`);
+  }
+
+  const local = (await listTaskMinutes()).find((m) => m.taskId === id);
+  // Approved is sheet-bound but not yet appended, so it folds into the pushed
+  // bucket — the count and the mention keep it visible.
+  const pushed = (local?.pushedMinutes ?? 0) + (local?.approvedMinutes ?? 0);
+  const drafts = local?.draftMinutes ?? 0;
+  // The union rule from the design doc: either ledger having hours makes the
+  // task "covered", but the two are never summed in one number.
+  const opSide = refreshed ? opMinutes ?? 0 : task.spentMinutes ?? 0;
+  const attached = opSide > 0 || pushed + drafts > 0;
+
+  console.log(
+    `task #${id} "${task.subject}" (${task.projectKey}${task.status ? `, ${task.status}` : ''})`,
+  );
+  console.log(`attached: ${attached ? green('yes') : dim('no')}`);
+
+  if (refreshed) {
+    // Fresh totals win: the cache may be stale, the time-entry list is not.
+    console.log(
+      `  OpenProject: ${formatMinutesShort(opMinutes ?? 0)} (${opEntryCount} time entr${
+        opEntryCount === 1 ? 'y' : 'ies'
+      })`,
+    );
+  } else if (task.spentMinutes !== null) {
+    // Cached without a refresh — the cache holds no entry count, only the sum.
+    console.log(`  OpenProject: ${formatMinutesShort(task.spentMinutes)}`);
+  }
+
+  const localParts: string[] = [];
+  if (pushed > 0) {
+    const count = (local?.pushedEntries ?? 0) + (local?.approvedEntries ?? 0);
+    localParts.push(
+      `${formatMinutesShort(pushed)} pushed (${count} entr${count === 1 ? 'y' : 'ies'}${
+        local && local.approvedEntries > 0 ? `, incl. ${local.approvedEntries} approved` : ''
+      })`,
+    );
+  }
+  if (drafts > 0) {
+    localParts.push(
+      `${formatMinutesShort(drafts)} drafts (${local?.draftEntries ?? 0} entr${
+        (local?.draftEntries ?? 0) === 1 ? 'y' : 'ies'
+      })`,
+    );
+  }
+  if (localParts.length) console.log(`  local sheet: ${localParts.join(' + ')}`);
+  if (note) console.log(`\n${warnNote ? yellow(note) : dim(note)}`);
+}
+
+export async function cmdTasks(args: ParsedArgs): Promise<void> {
+  const cfg = loadConfig();
+  const projectRaw = flagString(args.flags, 'project');
+  const project = projectRaw ? requireProject(projectRaw, cfg) : null;
+
+  const [tasks, minutes] = await Promise.all([
+    listTasks(project ? { projectKey: project.key } : {}),
+    listTaskMinutes(),
+  ]);
+  const byTask = new Map<string, TaskMinutes>();
+  for (const m of minutes) byTask.set(m.taskId, m);
+
+  const rows: string[][] = [];
+  for (const t of tasks) {
+    const local = byTask.get(t.id);
+    const pushed = (local?.pushedMinutes ?? 0) + (local?.approvedMinutes ?? 0);
+    const drafts = local?.draftMinutes ?? 0;
+    // The report is tasks with hours attached — on either ledger.
+    const opSide = t.spentMinutes ?? 0;
+    if (opSide === 0 && pushed + drafts === 0) continue;
+
+    const sheetSide = [
+      pushed > 0 ? `${formatMinutesShort(pushed)} pushed` : '',
+      drafts > 0 ? `${formatMinutesShort(drafts)} drafts` : '',
+    ]
+      .filter(Boolean)
+      .join(' + ');
+
+    // Subjects run long; the full one is one `hours task <id>` away.
+    const subject = t.subject.replace(/\s+/g, ' ').trim();
+    const clipped = subject.length > 60 ? `${subject.slice(0, 59)}…` : subject;
+
+    rows.push([
+      `#${t.id}`,
+      t.projectKey,
+      t.status ?? dim('—'),
+      clipped,
+      opSide > 0 ? formatMinutesShort(opSide) : dim('—'),
+      sheetSide || dim('—'),
+    ]);
+  }
+
+  if (rows.length === 0) {
+    console.log(
+      dim(
+        `no cached tasks with hours attached${project ? ` for ${project.key}` : ''} — run \`hours task <id>\` to cache one`,
+      ),
+    );
+    return;
+  }
+
+  console.log(renderTable(['TASK', 'PROJECT', 'STATUS', 'SUBJECT', 'OPENPROJECT', 'SHEET'], rows));
 }

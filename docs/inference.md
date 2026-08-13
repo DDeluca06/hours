@@ -13,8 +13,13 @@ A signal is one timestamped observation. Nothing more is claimed for it.
 | `manual` | you, via `hours log` | 4 |
 | `calendar` | reserved, not yet collected | 4 |
 | `git_branch` | `git reflog` checkouts | 2 |
-| `claude_session` | user turns in `~/.claude/projects/*/*.jsonl` | 1 |
-| `file_edit` | reserved, not yet collected | 1 |
+| `claude_session` | prompts in `~/.claude/projects/*/*.jsonl`, spanning the turn | 1, or 2 measured |
+| `opencode_session` | messages in `~/.local/share/opencode/storage`, spanning the turn | 1, or 2 measured |
+| `file_edit` | VS Code-family local history (saves) | 1 |
+
+A signal that carries a measured `until` weighs at least 2: it is evidence of *duration*, not
+just of presence. It stays below a commit's 4 — wall-clock in a session proves the machine was
+busy, a commit proves you decided something. See [harnesses.md](harnesses.md).
 
 Two details in the git reader matter:
 
@@ -36,11 +41,17 @@ becomes an **unattributed** signal rather than a guess.
    Splitting one interleaved timeline by project instead shredded a single push into one run
    per commit, because a session signal from an unwatched directory lands between every pair
    of commits.
-2. **Cut runs on an idle gap** longer than `gapMin` (default 25 min).
-3. **Apply the lead-in.** Most signals are *trailing edges* — a commit at 10:45 records work
-   that happened before 10:45, not at it. So a block ends at its last signal and starts at its
-   first minus `leadInMin` (default 20). Without this, six commits infer six zero-length
-   blocks and the day reports 0 hours.
+2. **Cut runs on an idle gap** longer than `gapMin` (default 25 min), measured from the
+   previous signal's *end* — see the next step.
+3. **Apply the lead-in, unless the time was measured.** Most signals are *trailing edges* — a
+   commit at 10:45 records work that happened before 10:45, not at it. So a block ends at its
+   last signal and starts at its first minus `leadInMin` (default 20). Without this, six
+   commits infer six zero-length blocks and the day reports 0 hours.
+
+   An agent-harness turn is the exception: it carries `until`, a clocked end, so its duration
+   is known rather than guessed. A run opening with a measured span gets **no** lead-in — the
+   start is already a fact, and guessing on top of it would invent time. Full treatment in
+   [harnesses.md](harnesses.md).
 4. **Clamp to the workday** (9:00–15:00 by default). Set `HOURS_ALLOW_OUTSIDE=1` to keep
    evening work instead of discarding it.
 5. **Round to the 15-minute grid** the sheet uses, and drop anything under `minBlockMin`.
@@ -86,9 +97,13 @@ offered as unattributed suggestions.
 
 **It under-reports sparsely committed days.** Four commits spread across a day are four
 isolated points, so the lead-in is all the evidence there is: 4 × 15m = 1 hour, whatever the
-day actually felt like. Session signals fill that gap when you were working in a watched repo;
-otherwise the review step is where you fix it. This is intentional — the tool will never invent
-time you cannot defend.
+day actually felt like. Harness spans and editor saves fill that gap when you were working in a
+watched repo; otherwise the review step is where you fix it. This is intentional — the tool will
+never invent time you cannot defend.
+
+**Thinking away from the keyboard is invisible.** Every source here observes a machine. An hour
+at a whiteboard, a call, or reading someone else's code in a browser produces no signal at all,
+and no amount of harness instrumentation will change that. `hours log` exists for it.
 
 **Confidence is a hint, not a verdict.** `hours review` prints the reason and confidence for
 every draft. Anything under 0.6 came from weak evidence and deserves a look.

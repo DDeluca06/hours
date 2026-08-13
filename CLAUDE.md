@@ -5,9 +5,9 @@ Guidance for Claude Code working in this repository.
 ## What This Is
 
 A standalone time-tracking tool for the North10AI and LP Internal AI engagements. It collects
-passive evidence of work (git commits, branch checkouts, Claude Code session turns), infers a
-draft timesheet from it, and — after explicit review and confirmation — appends rows to the two
-tabs of a shared Google Sheet the team already uses.
+passive evidence of work (git commits, branch checkouts, Claude Code and OpenCode turns, editor
+saves), infers a draft timesheet from it, and — after explicit review and confirmation — appends
+rows to the two tabs of a shared Google Sheet the team already uses.
 
 It connects to `~/Projects/NorthAI` and `~/Projects/lp-internal-ai-v1` read-only, as watched
 repos. It shares no code with them.
@@ -18,7 +18,7 @@ repos. It shares no code with them.
 |---|---|
 | Language | TypeScript (strict, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`) |
 | Store | SQLite via Prisma 7 + `@prisma/adapter-better-sqlite3` |
-| Sheets | `googleapis` with a service account (`spreadsheets` scope) |
+| Sheets | `googleapis` with OAuth (user consent, refresh token in `~/.config/hours/credentials.json`) or a service account |
 | MCP | `@modelcontextprotocol/sdk` (stdio) |
 | Tests | Vitest |
 | Monorepo | pnpm workspaces |
@@ -33,13 +33,14 @@ passed to `PrismaClient` (runtime), **not** in the schema's `datasource` block. 
 ```bash
 pnpm install
 pnpm db:generate && pnpm db:push     # from the repo root
-pnpm test                            # 92 tests
+pnpm test                            # 248 tests
 pnpm -r typecheck
 pnpm lint
 
 pnpm hours <command>                 # the CLI
 pnpm collect                         # the sweep daemon
 pnpm mcp                             # the MCP server (stdio)
+pnpm sheets:auth                     # one-time OAuth consent (needs a Desktop OAuth client)
 pnpm sheets:probe                    # inspect the real spreadsheet (needs credentials)
 ```
 
@@ -70,8 +71,14 @@ These are load-bearing. Breaking one is a correctness bug, not a style question.
 
 1. **Inferred time never exceeds wall-clock time.** Overlapping blocks are apportioned, not
    summed. The regression tests are in `packages/core/src/overlaps.test.ts` and they exist
-   because the first version billed one minute of pushing as 1h30m.
+   because the first version billed one minute of pushing as 1h30m. Signals carrying a measured
+   span (`until`) go through the same apportionment — `packages/core/src/spans.test.ts` proves
+   it for them rather than assuming the point-signal proof carries over.
 2. **Signals are append-only and idempotent** on `sourceId`. Re-collecting must be a no-op.
+   The single exception is `recordSignalSpans`, which grows a measured `until` on an
+   *unconsumed* signal because a turn's end is not knowable while the turn is running. It moves
+   forward only, so it stays idempotent; a consumed signal is never touched, or its entry's
+   duration would disagree with its own evidence. See `docs/harnesses.md`.
 3. **Attributed work is arbitrated before unattributed work**, and unattributed blocks are
    clipped against what attributed blocks claimed. Otherwise a long session in an unwatched
    directory crowds out a real commit and that time disappears.
@@ -83,6 +90,13 @@ These are load-bearing. Breaking one is a correctness bug, not a style question.
 6. **Appends are bounded to the tab's data columns.** `discoverLayout` computes `dataWidth`
    precisely so `values.append` cannot treat a pivot table as part of the table to extend.
 7. **The sheet is append-only.** No updates, no deletes — other people's rows live there.
+8. **Several processes share the store.** The CLI, Claude Code's MCP server, OpenCode's, and
+   the collector daemon all write to one SQLite file, so no invariant may rest on a
+   read-then-write pair in a single process. One open timer is a unique index on
+   `Timer.openKey`; stopping is conditional on `stoppedAt: null`; pushing takes a lease on
+   each entry before the append. Every mutation in `packages/db` goes through
+   `withBusyRetry` — SQLite returns SQLITE_BUSY without waiting when a transaction upgrades
+   a read lock, so the retry lives outside the transaction. See `docs/mcp.md`.
 
 ## Sheet conventions
 
@@ -103,7 +117,11 @@ Discovered at runtime, never hard-coded, because the tabs disagree with each oth
 - No `any`. No non-null assertions in `src/` (tests may use them).
 - Operational failures are messages, not stack traces; `HOURS_DEBUG=1` restores the trace.
 - New signal sources go in `apps/collector/src/`, export a function returning `Signal[]` with
-  stable `sourceId`s, and get a weight in `KIND_WEIGHT` in `packages/core/src/blocks.ts`.
+  stable `sourceId`s, and get a weight in `KIND_WEIGHT` in `packages/core/src/blocks.ts`. Set
+  `until` only when the source genuinely clocked the work — a guessed duration presented as a
+  measured one defeats the distinction the inference rests on. Checklist in `docs/harnesses.md`.
+- A missing harness or editor store is empty, not an error: each source is wrapped on its own
+  in `sweep`, because a machine with one of the three installed is the normal case.
 - Adding a project needs no code change — it goes in `hours.config.json`.
 
 ## Related
