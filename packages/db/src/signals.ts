@@ -159,6 +159,99 @@ export async function recordSignalSpans(signals: readonly Signal[]): Promise<num
   return advanced;
 }
 
+/** A fresh observation that covers ground an already-billed one already claimed. */
+export interface ConsumedSpanOverlap {
+  /** The new signal. */
+  sourceId: string;
+  /** The consumed signal whose span it covers. */
+  consumedSourceId: string;
+  kind: string;
+  projectKey: string | null;
+  overlapMinutes: number;
+}
+
+/**
+ * Signals that are new but describe time an already-consumed signal claimed.
+ *
+ * This exists for one specific failure that the sourceId scheme cannot prevent.
+ * A source whose signal is anchored at the start of a run — heartbeats — loses
+ * its anchor if evidence arrives *late* with an earlier timestamp: wakatime-cli
+ * buffers heartbeats while offline and flushes them with their original times,
+ * which can extend a run backwards or join two runs that had a gap between them.
+ * The result is a new sourceId for work whose earlier signal was already folded
+ * into an entry. `recordSignals` cannot see it (the id is genuinely new) and
+ * `recordSignalSpans` will not touch a consumed row, by design.
+ *
+ * So this reports it rather than hiding it. It is a diagnostic, not a gate:
+ * the apportionment in packages/core is what stops overlapping evidence being
+ * billed twice, and dropping the signal outright would lose real work when the
+ * overlap is partial. Compares only same-kind, same-project signals — a commit
+ * and a heartbeat covering the same minutes is the normal case and is exactly
+ * what apportionment is for.
+ */
+export async function findConsumedSpanOverlaps(
+  signals: readonly Signal[],
+): Promise<ConsumedSpanOverlap[]> {
+  if (signals.length === 0) return [];
+
+  const ends = signals.map((s) => (s.until ?? s.at).getTime());
+  const starts = signals.map((s) => s.at.getTime());
+  const windowStart = new Date(Math.min(...starts));
+  const windowEnd = new Date(Math.max(...ends));
+  const kinds = [...new Set(signals.map((s) => s.kind))];
+
+  const consumed = await prisma.signal.findMany({
+    where: {
+      kind: { in: kinds },
+      consumedAt: { not: null },
+      at: { lt: windowEnd },
+      // A point signal's span is its instant; a measured one's is at..until.
+      OR: [{ until: null, at: { gte: windowStart } }, { until: { gt: windowStart } }],
+    },
+    select: { sourceId: true, kind: true, at: true, until: true, projectKey: true },
+  });
+  if (consumed.length === 0) return [];
+
+  const fresh = new Set(
+    (
+      await prisma.signal.findMany({
+        where: { sourceId: { in: signals.map((s) => s.sourceId) } },
+        select: { sourceId: true },
+      })
+    ).map((r) => r.sourceId),
+  );
+
+  const out: ConsumedSpanOverlap[] = [];
+  for (const s of signals) {
+    // Only signals we have not stored yet: a re-observation of a row that is
+    // already consumed overlaps itself, which is not news.
+    if (fresh.has(s.sourceId)) continue;
+    const sStart = s.at.getTime();
+    const sEnd = (s.until ?? s.at).getTime();
+    for (const c of consumed) {
+      if (c.sourceId === s.sourceId) continue;
+      if (c.kind !== s.kind || c.projectKey !== s.projectKey) continue;
+      const cStart = c.at.getTime();
+      const cEnd = (c.until ?? c.at).getTime();
+      const overlapMs = Math.min(sEnd, cEnd) - Math.max(sStart, cStart);
+      // A point signal has no span, so a strict `> 0` would miss the case that
+      // matters most: a lone late heartbeat landing inside already-billed time,
+      // which reconstruction would otherwise hand a fresh lead-in to. Two spans
+      // that merely abut are not an overlap.
+      const isPoint = sEnd === sStart || cEnd === cStart;
+      if (isPoint ? overlapMs < 0 : overlapMs <= 0) continue;
+      out.push({
+        sourceId: s.sourceId,
+        consumedSourceId: c.sourceId,
+        kind: s.kind,
+        projectKey: s.projectKey,
+        overlapMinutes: Math.round(overlapMs / 60_000),
+      });
+    }
+  }
+  return out;
+}
+
 /** Mark signals as folded into an entry so reconstruction stays idempotent. */
 export async function consumeSignals(sourceIds: readonly string[]): Promise<void> {
   if (sourceIds.length === 0) return;

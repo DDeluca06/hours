@@ -77,9 +77,9 @@ describe('resolveOverlaps', () => {
     // The exact shape of the real bug: many activities, one 15-minute window.
     const activities = [
       'Development',
-      'Documentation',
+      'Data model',
       'Misc',
-      'Deployment',
+      'Client Meeting',
       'Testing/QA',
       'Scoping',
     ] as const;
@@ -95,22 +95,22 @@ describe('resolveOverlaps', () => {
   it('splits a long shared window proportionally to the evidence', () => {
     const blocks = [
       block({ startMin: 540, endMin: 660, activity: 'Development', signalIds: ['a', 'b', 'c'] }),
-      block({ startMin: 560, endMin: 660, activity: 'Documentation', signalIds: ['d'] }),
+      block({ startMin: 560, endMin: 660, activity: 'Data model', signalIds: ['d'] }),
     ];
     const resolved = resolveOverlaps(blocks);
 
     expect(totalMinutes(resolved)).toBeLessThanOrEqual(120);
     const dev = resolved.find((b) => b.activity === 'Development');
-    const docs = resolved.find((b) => b.activity === 'Documentation');
+    const model = resolved.find((b) => b.activity === 'Data model');
     // Three commits of evidence should outweigh one.
-    expect(dev?.minutes ?? 0).toBeGreaterThan(docs?.minutes ?? 0);
+    expect(dev?.minutes ?? 0).toBeGreaterThan(model?.minutes ?? 0);
   });
 
   it('produces blocks that no longer overlap each other', () => {
     const blocks = [
       block({ startMin: 540, endMin: 660, activity: 'Development' }),
       block({ startMin: 550, endMin: 640, activity: 'Testing/QA' }),
-      block({ startMin: 560, endMin: 620, activity: 'Documentation' }),
+      block({ startMin: 560, endMin: 620, activity: 'Data model' }),
     ];
     const resolved = resolveOverlaps(blocks).sort((a, b) => a.startMin - b.startMin);
     for (let i = 1; i < resolved.length; i++) {
@@ -123,8 +123,8 @@ describe('resolveOverlaps', () => {
   it('keeps every signal id, including from activities it had to drop', () => {
     const blocks = [
       block({ startMin: 885, endMin: 900, activity: 'Development', signalIds: ['a'] }),
-      block({ startMin: 885, endMin: 900, activity: 'Documentation', signalIds: ['b'] }),
-      block({ startMin: 885, endMin: 900, activity: 'Deployment', signalIds: ['c'] }),
+      block({ startMin: 885, endMin: 900, activity: 'Data model', signalIds: ['b'] }),
+      block({ startMin: 885, endMin: 900, activity: 'Client Meeting', signalIds: ['c'] }),
     ];
     const resolved = resolveOverlaps(blocks);
     const ids = new Set(resolved.flatMap((b) => b.signalIds));
@@ -222,12 +222,12 @@ describe('evidence weighting', () => {
   it('weights a commit above a session turn when a window is shared', () => {
     const blocks = [
       block({ startMin: 540, endMin: 600, activity: 'Development', weight: 4 }),
-      block({ startMin: 540, endMin: 600, activity: 'Documentation', weight: 1 }),
+      block({ startMin: 540, endMin: 600, activity: 'Data model', weight: 1 }),
     ];
     const resolved = resolveOverlaps(blocks);
     const dev = resolved.find((b) => b.activity === 'Development');
-    const docs = resolved.find((b) => b.activity === 'Documentation');
-    expect(dev?.minutes ?? 0).toBeGreaterThan(docs?.minutes ?? 0);
+    const model = resolved.find((b) => b.activity === 'Data model');
+    expect(dev?.minutes ?? 0).toBeGreaterThan(model?.minutes ?? 0);
   });
 });
 

@@ -24,12 +24,12 @@ describe('toSheetRow', () => {
       person: 'Demitri',
       hours: '1:45:00',
       activity: 'Development',
-      notes: '9:00 - 10:45 | Stand-up',
+      notes: '9:00 AM - 10:45 AM | Stand-up',
     });
   });
 
   it('omits the pipe when there is no description', () => {
-    expect(toSheetRow(entry()).notes).toBe('9:00 - 10:45');
+    expect(toSheetRow(entry()).notes).toBe('9:00 AM - 10:45 AM');
   });
 
   // Parsing "2026-08-12" as a bare date yields UTC midnight, which is the 11th
@@ -45,7 +45,7 @@ describe('toSheetRow', () => {
 
   it('prefixes the task ref before the clock range', () => {
     const row = toSheetRow(entry({ taskId: '136', description: 'Stand-up' }));
-    expect(row.notes).toBe('[#136] 9:00 - 10:45 | Stand-up');
+    expect(row.notes).toBe('[#136] 9:00 AM - 10:45 AM | Stand-up');
   });
 
   it('is exactly the task ref alone when there is no range or description', () => {
@@ -53,7 +53,7 @@ describe('toSheetRow', () => {
   });
 
   it('omits the ref when the entry has no taskId', () => {
-    expect(toSheetRow(entry()).notes).toBe('9:00 - 10:45');
+    expect(toSheetRow(entry()).notes).toBe('9:00 AM - 10:45 AM');
   });
 });
 

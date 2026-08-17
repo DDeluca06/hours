@@ -26,6 +26,8 @@ import {
   toSheetRow,
   validateEntries,
   ACTIVITIES,
+  activityListText,
+  activityParamHint,
   type Activity,
   type Entry,
 } from '@hours/core';
@@ -33,7 +35,8 @@ import {
   approveEntries,
   claimEntriesForPush,
   createEntries,
-  currentTimer,
+  openTimers,
+  resolveTimerTarget,
   getTask,
   listEntries,
   listOpenProjectTimeEntries,
@@ -46,6 +49,7 @@ import {
   stopTimer,
   updateEntry,
   upsertTasks,
+  type OpenTimer,
   type StoredEntry,
 } from '@hours/lib-db';
 import { reconstruct, sweep } from '@hours/collector';
@@ -82,7 +86,8 @@ function resolveProject(key?: string, cwd?: string) {
     const byKey = projectByKey(key, cfg.projects);
     if (byKey) return byKey;
     throw new Error(
-      `unknown project "${key}" — known projects: ${cfg.projects.map((p) => p.key).join(', ')}`,
+      `unknown project "${key}" — known projects: ${cfg.projects.map((p) => p.key).join(', ')}` +
+        ' (hours project keys are short registry keys; OpenProject identifiers like "north10-ai" are not them)',
     );
   }
   if (cwd) {
@@ -143,8 +148,34 @@ server.registerTool(
       );
       for (const repo of p.repoPaths) lines.push(`    watches ${repo}`);
     }
-    lines.push('', `Activities: ${ACTIVITIES.join(', ')}`);
+    lines.push(
+      '',
+      `Activities: ${ACTIVITIES.join(', ')} — call list_activities for what each one is for and the accepted shorthands`,
+    );
     return text(lines.join('\n'));
+  },
+);
+
+server.registerTool(
+  'list_activities',
+  {
+    title: 'List the sheet activities',
+    description:
+      'The fixed activity taxonomy for the activity parameter: every acceptable value, what each one is for, and the accepted shorthands. Call this whenever an activity does not seem to fit instead of inventing a new label — unknown labels are refused, not guessed, because the sheet pivots on these exact values.',
+    inputSchema: {},
+  },
+  async () => {
+    return text(
+      [
+        'The activity parameter takes one of these fixed values (the sheet\'s Activity/Category column — some tabs call it "Activity", others "Category").',
+        'Free-form description of what you did goes in the note parameter, not here.',
+        'OpenProject\'s own activity names (Management, Specification, …) are a different vocabulary and are not accepted.',
+        '',
+        activityListText(),
+        '',
+        'Shorthands and unique prefixes also resolve ("dev", "qa", "wire"). Anything else is refused with an error naming the full list.',
+      ].join('\n'),
+    );
   },
 );
 
@@ -164,7 +195,7 @@ server.registerTool(
     const entries = await listEntries({ day: target });
     const total = entries.reduce((s, e) => s + e.minutes, 0);
     const issues = validateEntries(entries);
-    const timer = await currentTimer();
+    const timers = await openTimers();
 
     return text(
       [
@@ -173,9 +204,9 @@ server.registerTool(
         issues.length
           ? `\nvalidation:\n${issues.map((i) => `  ${i.severity}: ${i.message}`).join('\n')}`
           : '',
-        timer
-          ? `\ntimer running: ${timer.projectKey} ${timer.activity ?? '(no activity)'} since ${timer.startedAt.toISOString()}`
-          : '',
+        ...timers.map(
+          (t) => `\ntimer running: ${t.projectKey} ${t.activity ?? '(no activity)'} since ${t.startedAt.toISOString()}`,
+        ),
       ]
         .filter(Boolean)
         .join('\n'),
@@ -382,9 +413,7 @@ server.registerTool(
       'Record time already spent as a draft entry. Nothing reaches the spreadsheet until it is approved and pushed.',
     inputSchema: {
       minutes: z.number().int().positive().describe('Duration in minutes. Multiples of 15 match the sheet.'),
-      activity: z
-        .string()
-        .describe(`One of: ${ACTIVITIES.join(', ')}. Shorthands like "dev" or "qa" also resolve.`),
+      activity: z.string().describe(activityParamHint()),
       project: z.string().optional().describe('Project key. Inferred from cwd if omitted.'),
       cwd: z.string().optional().describe('Working directory, used to infer the project.'),
       day: z.string().optional().describe('YYYY-MM-DD. Defaults to today.'),
@@ -410,7 +439,7 @@ server.registerTool(
       const resolved = resolveActivity(activity);
       if (!resolved) {
         return fail(
-          `"${activity}" is not a recognizable activity. Use one of: ${ACTIVITIES.join(', ')}`,
+          `"${activity}" is not a recognizable activity. The activity parameter takes one of the sheet's fixed values (shorthands like "dev" also resolve; a description of the work goes in note):\n${activityListText()}`,
         );
       }
       if (!cfg.person) return fail('HOURS_PERSON is not set, so there is no name for the Person column');
@@ -449,11 +478,14 @@ server.registerTool(
   {
     title: 'Start a timer',
     description:
-      'Begin timing work on a project. Starting a timer while one is running stops the old one and discards its time, so check timer_status first.',
+      'Begin timing work on a project. Timers run per project — starting on a project that already has one running stops the old one and discards its time, while timers on other projects keep running. Check timer_status first.',
     inputSchema: {
       project: z.string().optional().describe('Project key. Inferred from cwd if omitted.'),
       cwd: z.string().optional(),
-      activity: z.string().optional().describe('Can also be supplied when stopping.'),
+      activity: z
+        .string()
+        .optional()
+        .describe(`Can also be supplied when stopping. ${activityParamHint()}`),
       note: z.string().optional(),
       taskId: z
         .string()
@@ -465,13 +497,17 @@ server.registerTool(
     try {
       const p = resolveProject(project, cwd);
       const resolved = activity ? resolveActivity(activity) : null;
-      if (activity && !resolved) return fail(`"${activity}" is not a recognizable activity`);
+      if (activity && !resolved) {
+        return fail(
+          `"${activity}" is not a recognizable activity:\n${activityListText()}`,
+        );
+      }
       if (taskId !== undefined) {
         const problem = await checkTaskId(taskId);
         if (problem !== null) return fail(problem);
       }
 
-      const { started, replaced } = await startTimer({
+      const { started, replaced, concurrent } = await startTimer({
         projectKey: p.key,
         ...(resolved ? { activity: resolved } : {}),
         ...(note ? { note } : {}),
@@ -482,6 +518,12 @@ server.registerTool(
           `started ${started.projectKey} ${started.activity ?? '(activity at stop time)'} at ${started.startedAt.toISOString()}`,
           replaced
             ? `NOTE: stopped and discarded a running ${replaced.projectKey} timer worth ${formatMinutesShort(replaced.minutes)} — log it manually if it mattered`
+            : '',
+          // Told to the agent at start time on purpose: from now on both timers
+          // accumulate the same minutes and each will log all of them to its own
+          // contract. Nothing downstream blocks that.
+          concurrent.length
+            ? `WARNING: ${concurrent.map((t) => t.projectKey).join(', ')} timer(s) are also running, so the same wall-clock minutes are accruing on more than one project. Stop one unless the overlap is intended.`
             : '',
         ]
           .filter(Boolean)
@@ -497,27 +539,58 @@ server.registerTool(
   'stop_timer',
   {
     title: 'Stop the timer',
-    description: 'Stop the running timer and turn its elapsed time into a draft entry.',
+    description:
+      'Stop a running timer and turn its elapsed time into a draft entry. Defaults to the most recently started timer; pass project to stop that project\u2019s instead. Timers on other projects keep running.',
     inputSchema: {
-      activity: z.string().optional().describe('Required unless the timer was started with one.'),
+      project: z
+        .string()
+        .optional()
+        .describe('Project key of the timer to stop. Defaults to the most recently started.'),
+      activity: z
+        .string()
+        .optional()
+        .describe(`Required unless the timer was started with one. ${activityParamHint()}`),
       note: z.string().optional(),
     },
   },
-  async ({ activity, note }) => {
-    const open = await currentTimer();
-    if (!open) return text('no timer running');
+  async ({ project, activity, note }) => {
+    let projectKey: string | undefined;
+    if (project) {
+      try {
+        projectKey = resolveProject(project).key;
+      } catch (err) {
+        return fail(err instanceof Error ? err.message : String(err));
+      }
+    }
+    const all = await openTimers();
+    // Refuses rather than guessing when several are running — stopping the
+    // newest would bank one contract's afternoon against the other. Resolved
+    // here so the refusal is a tool error, not a thrown stack.
+    let target: OpenTimer | null;
+    try {
+      target = resolveTimerTarget(all, projectKey);
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
+    if (!target) {
+      return text(projectKey ? `no timer running on ${projectKey}` : 'no timer running');
+    }
 
-    const stopped = await stopTimer();
+    const stopped = await stopTimer({ projectKey: target.projectKey });
     if (!stopped) return text('no timer running');
 
     const activityRaw = activity ?? stopped.activity;
     if (!activityRaw) {
       return fail(
-        `the timer had no activity, so nothing was logged. Its ${formatMinutesShort(stopped.minutes)} is not saved — call log_time with an activity to record it.`,
+        `the ${stopped.projectKey} timer had no activity, so nothing was logged. Its ${formatMinutesShort(stopped.minutes)} is not saved — call log_time with an activity to record it.`,
       );
     }
     const resolved = resolveActivity(activityRaw);
-    if (!resolved) return fail(`"${activityRaw}" is not a recognizable activity`);
+    if (!resolved) {
+      return fail(
+        `"${activityRaw}" is not a recognizable activity. Call list_activities or retry with one of:\n${activityListText()}`,
+      );
+    }
     if (!cfg.person) return fail('HOURS_PERSON is not set');
 
     const startMin = stopped.startedAt.getHours() * 60 + stopped.startedAt.getMinutes();
@@ -551,15 +624,19 @@ server.registerTool(
   'timer_status',
   {
     title: 'Timer status',
-    description: 'Whether a timer is running, on what, and for how long.',
+    description: 'Which timers are running, on what, and for how long.',
     inputSchema: {},
   },
   async () => {
-    const open = await currentTimer();
-    if (!open) return text('no timer running');
-    const mins = Math.round((Date.now() - open.startedAt.getTime()) / 60_000);
+    const all = await openTimers();
+    if (all.length === 0) return text('no timer running');
     return text(
-      `${open.projectKey} ${open.activity ?? '(no activity yet)'} — ${formatMinutesShort(mins)} so far, since ${open.startedAt.toISOString()}`,
+      all
+        .map((open) => {
+          const mins = Math.round((Date.now() - open.startedAt.getTime()) / 60_000);
+          return `${open.projectKey} ${open.activity ?? '(no activity yet)'} — ${formatMinutesShort(mins)} so far, since ${open.startedAt.toISOString()}`;
+        })
+        .join('\n'),
     );
   },
 );
@@ -675,7 +752,7 @@ server.registerTool(
         .string()
         .optional()
         .describe('Brief description for the Notes column. Empty string clears it.'),
-      activity: z.string().optional().describe('One of the sheet activities.'),
+      activity: z.string().optional().describe(activityParamHint()),
       minutes: z.number().int().positive().optional().describe('Duration in minutes.'),
       day: z.string().optional().describe('YYYY-MM-DD.'),
       taskId: z
@@ -708,7 +785,9 @@ server.registerTool(
       if (note !== undefined) patch.description = note;
       if (activity !== undefined) {
         if (!ACTIVITIES.includes(activity as Activity)) {
-          return fail(`"${activity}" is not a sheet activity — choose one of: ${ACTIVITIES.join(', ')}`);
+          return fail(
+            `"${activity}" is not a sheet activity — choose one of:\n${activityListText()}`,
+          );
         }
         patch.activity = activity as Activity;
       }

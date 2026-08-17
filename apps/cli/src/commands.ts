@@ -11,12 +11,15 @@ import { createInterface } from 'node:readline/promises';
 import { loadConfig, requirePushConfig, type HoursConfig } from '@hours/config';
 import {
   collectNotes,
+  formatClock,
   formatMinutesShort,
   localDayKey,
   projectByKey,
   resolveActivity,
   toSheetRow,
   validateEntries,
+  activityListText,
+  activityParamText,
   type Activity,
   type Entry,
   type ProjectDef,
@@ -25,7 +28,8 @@ import {
   approveEntries,
   claimEntriesForPush,
   createEntries,
-  currentTimer,
+  openTimers,
+  resolveTimerTarget,
   cancelTimer,
   deleteEntry,
   getEntry,
@@ -73,10 +77,16 @@ function requireActivity(raw: string | undefined): Activity {
   const activity = resolveActivity(raw);
   if (!activity) {
     throw new Error(
-      `"${raw}" is not a recognizable activity — it must resolve to one of the sheet's values`,
+      `"${raw}" is not a recognizable activity — it must resolve to one of the sheet's values:\n${activityListText()}`,
     );
   }
   return activity;
+}
+
+export async function cmdActivities(): Promise<void> {
+  console.log(
+    `${activityParamText()}\n\nShorthands and unique prefixes also resolve ("dev", "qa", "wire").`,
+  );
 }
 
 /**
@@ -202,7 +212,7 @@ export async function cmdStart(args: ParsedArgs): Promise<void> {
   const activity = activityRaw ? requireActivity(activityRaw) : undefined;
   const note = flagString(args.flags, 'note');
 
-  const { started, replaced } = await startTimer({
+  const { started, replaced, concurrent } = await startTimer({
     projectKey: project.key,
     ...(activity ? { activity } : {}),
     ...(note ? { note } : {}),
@@ -211,36 +221,67 @@ export async function cmdStart(args: ParsedArgs): Promise<void> {
   if (replaced) {
     console.log(
       yellow(
-        `stopped the previous timer first: ${replaced.projectKey} ${replaced.activity ?? '(no activity)'} — ${formatMinutesShort(replaced.minutes)} discarded`,
+        `stopped the previous ${replaced.projectKey} timer first: ${replaced.activity ?? '(no activity)'} — ${formatMinutesShort(replaced.minutes)} discarded`,
       ),
     );
     console.log(dim('  (that time was not saved; log it with `hours log` if it mattered)'));
   }
   console.log(
     green('started'),
-    `${started.projectKey} ${started.activity ?? dim('(activity at stop time)')} at ${started.startedAt.toLocaleTimeString()}`,
+    `${started.projectKey} ${started.activity ?? dim('(activity at stop time)')} at ${formatClock(started.startedAt.getHours() * 60 + started.startedAt.getMinutes())}`,
   );
+
+  // Said at the start, not at the push: from here on both timers accumulate the
+  // same wall-clock minutes, and each will log all of them to its own contract.
+  for (const other of concurrent) {
+    const mins = Math.round((Date.now() - other.startedAt.getTime()) / 60_000);
+    console.log(
+      yellow(
+        `also running: ${other.projectKey} ${other.activity ?? '(no activity yet)'} — ${formatMinutesShort(mins)} so far`,
+      ),
+    );
+  }
+  if (concurrent.length) {
+    console.log(
+      dim(
+        '  (both timers now cover the same minutes — stop one, or expect to trim the overlap at review)',
+      ),
+    );
+  }
 }
 
 export async function cmdStop(args: ParsedArgs): Promise<void> {
   const cfg = loadConfig();
-  const open = await currentTimer();
-  if (!open) {
-    console.log(dim('no timer running'));
+  const all = await openTimers();
+
+  // With timers running on several projects the target must be named — see
+  // resolveTimerTarget. Resolved here rather than inside stopTimer so the
+  // activity check below still happens before anything is finalized.
+  const projectRaw = flagString(args.flags, 'project');
+  const target = resolveTimerTarget(
+    all,
+    projectRaw ? requireProject(projectRaw, cfg).key : undefined,
+  );
+  if (!target) {
+    console.log(
+      projectRaw
+        ? yellow(`no timer running on ${requireProject(projectRaw, cfg).key}`)
+        : dim('no timer running'),
+    );
     return;
   }
 
   // Decide whether an activity exists BEFORE stopping: stopTimer finalizes the
-  // open timer, and an error thrown after that would leave the time unrecoverable.
-  const activityRaw = flagString(args.flags, 'activity') ?? args.positionals[0] ?? open.activity;
+  // timer, and an error thrown after that would leave the time unrecoverable.
+  const activityRaw = flagString(args.flags, 'activity') ?? args.positionals[0] ?? target.activity;
   if (!activityRaw) {
     throw new Error(
-      `the timer has no activity — re-run as \`hours stop <activity>\`. The timer is still running and that will log it.`,
+      `the ${target.projectKey} timer has no activity — re-run as \`hours stop <activity>\`. The timer is still running and that will log it.`,
     );
   }
   const activity = requireActivity(activityRaw);
 
-  const stopped = await stopTimer();
+  const stopped = await stopTimer({ projectKey: target.projectKey });
   if (!stopped) return;
 
   const person = flagString(args.flags, 'person') ?? cfg.person;
@@ -254,9 +295,9 @@ export async function cmdStop(args: ParsedArgs): Promise<void> {
     minutes: stopped.minutes,
     activity,
     // Not clamped at midnight: formatClock wraps, so a 23:00 timer stopped
-    // after 90 minutes reads "23:00 - 0:30", which is what happened. Clamping
-    // to 1440 rendered it as "23:00 - 0:00" — a range whose length contradicts
-    // the Hours column.
+    // after 90 minutes reads "11:00 PM - 12:30 AM", which is what happened.
+    // Clamping to 1440 rendered it as "11:00 PM - 12:00 AM" — a range whose
+    // length contradicts the Hours column.
     ranges: [{ startMin, endMin: startMin + stopped.minutes }],
     status: 'draft',
     provenance: 'timer',
@@ -272,30 +313,31 @@ export async function cmdStop(args: ParsedArgs): Promise<void> {
   console.log(renderEntries(created ? [created] : []));
 }
 
-export async function cmdCancel(): Promise<void> {
-  const cancelled = await cancelTimer();
+export async function cmdCancel(args: ParsedArgs): Promise<void> {
+  const projectRaw = flagString(args.flags, 'project');
+  const projectKey = projectRaw ? requireProject(projectRaw, loadConfig()).key : undefined;
+  const cancelled = await cancelTimer(projectKey ? { projectKey } : {});
   console.log(
     cancelled
       ? yellow(`cancelled the ${cancelled.projectKey} timer — nothing logged`)
-      : dim('no timer running'),
+      : dim(projectKey ? `no timer running on ${projectKey}` : 'no timer running'),
   );
 }
 
 export async function cmdStatus(): Promise<void> {
   const cfg = loadConfig();
-  const open = await currentTimer();
+  const all = await openTimers();
   const today = localDayKey(new Date());
   const entries = await listEntries({ day: today });
 
-  if (open) {
+  for (const open of all) {
     const mins = Math.round((Date.now() - open.startedAt.getTime()) / 60_000);
     console.log(
       cyan('running'),
       `${open.projectKey} ${open.activity ?? dim('(no activity yet)')} — ${formatMinutesShort(mins)} so far`,
     );
-  } else {
-    console.log(dim('no timer running'));
   }
+  if (all.length === 0) console.log(dim('no timer running'));
 
   console.log(`\n${bold(today)}`);
   console.log(renderEntries(entries));

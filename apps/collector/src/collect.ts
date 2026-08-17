@@ -8,13 +8,28 @@
 // ---------------------------------------------------------------------------
 
 import { loadConfig } from '@hours/config';
-import { recordSignals, recordSignalSpans } from '@hours/lib-db';
+import { findConsumedSpanOverlaps, recordSignals, recordSignalSpans } from '@hours/lib-db';
 import type { Signal } from '@hours/core';
 import { collectCheckoutSignals, collectGitSignals, gitIdentity } from './git.js';
 import { collectSessionSignals } from './claude-sessions.js';
 import { collectOpenCodeSignals } from './opencode-sessions.js';
 import { collectEditorHistorySignals } from './editor-history.js';
+import { collectWakapiSignals, WakapiDayCache } from './wakapi-heartbeats.js';
 import { syncTasks } from './tasks.js';
+
+/**
+ * Reused across sweeps so the daemon stops re-downloading finished days every
+ * ten minutes. A CLI `hours collect` is a fresh process, so its cache is empty
+ * and it fetches everything — which is what you want from a manual run.
+ */
+const wakapiCache = new WakapiDayCache();
+
+/**
+ * Cap on how many overlap warnings one sweep prints. A backfill of a whole
+ * offline day can produce dozens, and a wall of them is read as noise — the
+ * count that follows them is the part that matters.
+ */
+const MAX_OVERLAP_WARNINGS = 5;
 
 export interface SweepResult {
   scanned: number;
@@ -121,6 +136,64 @@ export async function sweep(opts: SweepOptions = {}): Promise<SweepResult> {
     } catch (err) {
       warnings.push(`editor history: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  if (harnesses.wakapi) {
+    // Unlike the local sources, heartbeats need a server and a key, so the
+    // unconfigured state is *quiet* — same rule as the OpenProject cache. A
+    // half-configured one is a real mistake, though, and gets a warning: it
+    // looks exactly like the "tracking silently never starts" failure the
+    // source exists to cover.
+    const { url, apiKey } = cfg.wakapi;
+    if (url && !apiKey) {
+      warnings.push('wakapi: WAKAPI_URL set without WAKAPI_API_KEY — heartbeat collection is off');
+    } else if (apiKey && !url) {
+      warnings.push('wakapi: WAKAPI_API_KEY set without WAKAPI_URL — heartbeat collection is off');
+    } else if (url && apiKey) {
+      try {
+        const result = await collectWakapiSignals({
+          url,
+          apiKey,
+          since,
+          projects: cfg.projects,
+          // The same bound the harness sources get. Without it a heartbeat run
+          // that bridges a lunch break is one multi-hour *measured* signal, and
+          // measured spans skip the conservative lead-in precisely because they
+          // are supposed to be short and observed.
+          maxSpanMin: harnesses.maxSpanMin,
+          cache: wakapiCache,
+        });
+        all.push(...result.signals);
+        warnings.push(...result.warnings);
+        bySource['wakapi'] = result.signals.length;
+      } catch (err) {
+        warnings.push(`wakapi: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  // Before writing: does any of this new evidence describe minutes an
+  // already-billed signal claimed? That happens when a source's anchor moves —
+  // an offline wakatime-cli flushing buffered heartbeats into a run that was
+  // already folded into an entry. Apportionment stops it being billed twice;
+  // this stops it being invisible. Best-effort: a failure here must not cost the
+  // sweep its signals.
+  try {
+    const overlaps = await findConsumedSpanOverlaps(all);
+    for (const o of overlaps.slice(0, MAX_OVERLAP_WARNINGS)) {
+      warnings.push(
+        `${o.kind}: new signal ${o.sourceId} covers ${o.overlapMinutes}m already counted by ${o.consumedSourceId} — late-arriving evidence re-anchored a run; review ${o.projectKey ?? 'unattributed'} time for that stretch`,
+      );
+    }
+    if (overlaps.length > MAX_OVERLAP_WARNINGS) {
+      warnings.push(
+        `…and ${overlaps.length - MAX_OVERLAP_WARNINGS} more signal(s) overlapping already-counted evidence`,
+      );
+    }
+  } catch (err) {
+    warnings.push(
+      `overlap check skipped: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 
   const recorded = await recordSignals(all);

@@ -205,8 +205,17 @@ function findOverlaps(entries: readonly Entry[]): string[] {
       const prev = flat[i - 1];
       const cur = flat[i];
       if (prev && cur && cur.r.startMin < prev.r.endMin) {
+        const minutes = Math.min(prev.r.endMin, cur.r.endMin) - cur.r.startMin;
+        // Cross-project overlap is named as what it is. Two per-project timers
+        // left running together bill the same wall-clock minutes to both
+        // contracts, and each one measures from its own start so neither can
+        // notice; this line is the last place before the sheet where someone can.
+        const across =
+          prev.e.projectKey === cur.e.projectKey
+            ? ''
+            : ` — the same ${minutes}m is billed to both ${prev.e.projectKey} and ${cur.e.projectKey}`;
         out.push(
-          `${k.replace('|', ' ')}: "${prev.e.activity}" and "${cur.e.activity}" overlap in time`,
+          `${k.replace('|', ' ')}: "${prev.e.activity}" and "${cur.e.activity}" overlap by ${minutes}m${across}`,
         );
       }
     }

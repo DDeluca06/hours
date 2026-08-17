@@ -62,6 +62,8 @@ export interface HarnessConfig {
   openCode: boolean;
   /** VS Code-family local history (VSCodium, Cursor, …). */
   editors: boolean;
+  /** WakaTime heartbeats from a self-hosted Wakapi server. Needs env creds to do anything. */
+  wakapi: boolean;
   /** Cap on one turn's measured span, so a parked tool call can't bill lunch. */
   maxSpanMin: number;
   /** Rewrite a foreign home directory in OpenCode paths onto this machine's. */
@@ -81,6 +83,8 @@ export interface HoursConfig {
   googleOAuth: OAuthSpec | undefined;
   /** Read-only OpenProject connection for the task-hours cache. */
   openproject: OpenProjectConfig;
+  /** Read-only Wakapi connection for heartbeat collection. Env only. */
+  wakapi: { url: string | undefined; apiKey: string | undefined };
   projects: ProjectDef[];
   workday: WorkdayPolicy;
   harnesses: HarnessConfig;
@@ -146,6 +150,7 @@ function resolveHarnesses(
     claudeCode: toggle(env['HOURS_HARNESS_CLAUDE'], file?.claudeCode),
     openCode: toggle(env['HOURS_HARNESS_OPENCODE'], file?.openCode),
     editors: toggle(env['HOURS_HARNESS_EDITORS'], file?.editors),
+    wakapi: toggle(env['HOURS_HARNESS_WAKAPI'], file?.wakapi),
     // A garbled override falls back rather than throwing: nothing in this loader
     // throws, and an unbounded span is worse than the default one.
     maxSpanMin: Number.isFinite(spanRaw) && spanRaw > 0 ? spanRaw : DEFAULT_MAX_SPAN_MIN,
@@ -186,6 +191,10 @@ export function loadConfig(): HoursConfig {
       url: env['OPENPROJECT_URL'] ? env['OPENPROJECT_URL'] : undefined,
       apiKey: env['OPENPROJECT_API_KEY'] ? env['OPENPROJECT_API_KEY'] : undefined,
       projects: file.openproject?.projects,
+    },
+    wakapi: {
+      url: env['WAKAPI_URL'] ? env['WAKAPI_URL'] : undefined,
+      apiKey: env['WAKAPI_API_KEY'] ? env['WAKAPI_API_KEY'] : undefined,
     },
     projects: file.projects ?? DEFAULT_PROJECTS,
     workday: { ...DEFAULT_WORKDAY, ...file.workday },

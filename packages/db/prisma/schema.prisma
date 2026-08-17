@@ -50,10 +50,11 @@ model Signal {
   @@index([consumedAt])
 }
 
-/// A running timer. At most one may be open at a time, and that is now a
+/// A running timer. At most one may be open per project, and that is now a
 /// database constraint rather than a convention: the CLI, Claude Code's MCP
 /// server and OpenCode's each run their own process against this file, so a
-/// code-only check loses to a simultaneous start.
+/// code-only check loses to a simultaneous start. Timers on different projects
+/// run side by side — the person is on two engagements in one afternoon.
 model Timer {
   id         String   @id @default(cuid())
   projectKey String
@@ -64,12 +65,14 @@ model Timer {
   taskId     String?
   startedAt  DateTime
   stoppedAt  DateTime?
-  /// "open" while running, null once stopped — always in step with stoppedAt.
+  /// The project key while running, null once stopped — always in step with
+  /// stoppedAt.
   ///
-  /// This is how SQLite expresses "at most one open timer" without a partial
-  /// index: NULLs are distinct in a unique index, so any number of stopped
-  /// timers coexist while a second concurrent start hits the constraint and
-  /// fails instead of creating a rival timer.
+  /// This is how SQLite expresses "at most one open timer per project" without
+  /// a partial index: NULLs are distinct in a unique index, so any number of
+  /// stopped timers coexist while a second concurrent start on the same
+  /// project hits the constraint and fails instead of creating a rival timer.
+  /// A start on a *different* project carries a different key and coexists.
   openKey    String?  @unique
 
   @@index([stoppedAt])

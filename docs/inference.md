@@ -56,7 +56,8 @@ becomes an **unattributed** signal rather than a guess.
    evening work instead of discarding it.
 5. **Round to the 15-minute grid** the sheet uses, and drop anything under `minBlockMin`.
 6. **Classify.** Paths first, then commit subjects — `prisma/schema.prisma` is Data model,
-   `docs/` is Documentation, `.github/workflows/` is Deployment, `feat:`/`fix:` is Development.
+   `docs/` and `.github/workflows/` are Misc (no sheet category covers them; the reason keeps
+   that visible for review), `feat:`/`fix:` is Development.
    Path rules score by *share* of files matched, so one stray docs tweak inside a big feature
    commit does not relabel the block.
 7. **Merge neighbours** that share a project and activity.

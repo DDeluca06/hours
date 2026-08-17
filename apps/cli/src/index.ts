@@ -5,6 +5,7 @@
 
 import { parseArgs } from './args.js';
 import {
+  cmdActivities,
   cmdApprove,
   cmdCancel,
   cmdCollect,
@@ -30,10 +31,11 @@ const HELP = `${bold('hours')} — track what you did, for which project, and pu
 ${bold('during the day')}
   hours start <project> [activity]     start a timer  (-p/-a also work)
   hours stop [activity] [--note "..."] stop it and save a draft entry
-  hours cancel                         throw the running timer away
+                                       (timers run per project; -p stops that project's timer)
+  hours cancel [-p <project>]          throw a running timer away
   hours log <duration> <activity> -p <project> [-d <day>] [--note "..."] [--task <id>]
                                        log time you already spent
-  hours status                         timer, today's entries, uncounted signals
+  hours status                         timers, today's entries, uncounted signals
 
 ${bold('at 3 PM')}
   hours collect [--days 3]             sweep git, agent harnesses, editor saves
@@ -49,6 +51,7 @@ ${bold('at 3 PM')}
 ${bold('looking around')}
   hours task <id> [--refresh]          what a task has on it, both ledgers
   hours tasks [--project <key>]        cached tasks with hours attached
+  hours activities                     the fixed activity taxonomy and shorthands
   hours projects                       registry, watched repos, pushed totals
   hours sheet <project>                what the tab already says
 
@@ -77,6 +80,7 @@ const COMMANDS: Record<string, Handler> = {
   sheet: cmdSheet,
   task: cmdTask,
   tasks: cmdTasks,
+  activities: async () => cmdActivities(),
   projects: async () => cmdProjects(),
 };
 

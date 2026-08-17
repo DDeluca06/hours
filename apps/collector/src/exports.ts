@@ -17,3 +17,15 @@ export {
   defaultHistoryRoots,
   resourcePath,
 } from './editor-history.js';
+export {
+  collectWakapiSignals,
+  diagnoseHeartbeats,
+  fetchWakapiHeartbeats,
+  heartbeatShapeWarning,
+  heartbeatsToSignals,
+  usableHeartbeats,
+  daysToFetch,
+  WakapiDayCache,
+  WAKAPI_PAST_DAY_TTL_MS,
+  WAKAPI_RUN_GAP_MIN,
+} from './wakapi-heartbeats.js';

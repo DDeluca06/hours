@@ -8,7 +8,7 @@
 // sums.
 //
 // The Notes column carries the raw clock ranges the duration was derived from
-// ("9:00 - 10:45", "2-2:30, 3:30-3:45", "1:30 - 3:15 | Stand-up"). We both
+// ("9:00 AM - 10:45 AM", "2-2:30, 3:30-3:45", "1:30 - 3:15 | Stand-up"). We both
 // parse those (to reconstruct history) and emit them (so a pushed row explains
 // itself to a human reading the sheet).
 // ---------------------------------------------------------------------------
@@ -64,10 +64,13 @@ export function formatMinutesShort(minutes: number): string {
   return `${m}m`;
 }
 
-/** Minutes from midnight → "9:00", "14:45" (24h, no leading zero on hour). */
+/** Minutes from midnight → "9:00 AM", "2:45 PM" (12h, no leading zero on hour). */
 export function formatClock(minutesFromMidnight: number): string {
   const m = ((Math.round(minutesFromMidnight) % 1440) + 1440) % 1440;
-  return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}`;
+  const hour = Math.floor(m / 60);
+  const h12 = hour % 12 === 0 ? 12 : hour % 12;
+  const mer = hour < 12 ? 'AM' : 'PM';
+  return `${h12}:${String(m % 60).padStart(2, '0')} ${mer}`;
 }
 
 /**
@@ -104,7 +107,7 @@ export function parseClockToken(raw: string): number | null {
 /**
  * Parse the clock ranges out of a Notes cell.
  *
- * Handles "9:00 - 10:45", "2-2:30, 3:30-3:45", "2:30 PM - 3:30 PM", and
+ * Handles "9:00 AM - 10:45 AM", "2-2:30, 3:30-3:45", "2:30 PM - 3:30 PM", and
  * ignores any trailing free text after a "|" separator. Returns [] when the
  * cell holds no recognizable range, which is common — plenty of rows are just
  * a description.
@@ -127,7 +130,7 @@ export function parseClockRanges(notes: string | undefined | null): ClockRange[]
   return out;
 }
 
-/** Render ranges back into the Notes convention: "9:00 - 10:45, 1:00 - 2:30". */
+/** Render ranges back into the Notes convention: "9:00 AM - 10:45 AM, 1:00 PM - 2:30 PM". */
 export function formatClockRanges(ranges: readonly ClockRange[]): string {
   return ranges.map((r) => `${formatClock(r.startMin)} - ${formatClock(r.endMin)}`).join(', ');
 }

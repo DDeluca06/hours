@@ -44,13 +44,15 @@ registry are located from the source file's own path, so they are cwd-independen
 
 Both clients launch their own server process, the CLI is a third, and the collector daemon is
 a fourth. They share one SQLite file, so a timer started in OpenCode is the same timer
-`hours status` sees — not a second one.
+`hours status` sees — not a second one. Timers are scoped per project: `start_timer lp` and
+`start_timer north10` run side by side, while a second start on `lp` replaces the first.
 
 That sharing is enforced, not assumed:
 
-- **At most one open timer** is a unique index on `Timer.openKey`, not an if-statement. Eight
-  processes starting a timer at the same instant serialize into a replacement chain and leave
-  exactly one running.
+- **At most one open timer per project** is a unique index on `Timer.openKey`, not an
+  if-statement. The open timer's row carries its project key in `openKey`, so a different
+  project's timer never collides. Eight processes starting a timer on the same project at
+  the same instant serialize into a replacement chain and leave exactly one running.
 - **Stopping is a conditional update** on `stoppedAt: null`. Eight simultaneous stops produce
   one `StoppedTimer` and seven "no timer running" — so the same stretch of the day can never
   become two entries.
@@ -63,8 +65,11 @@ That sharing is enforced, not assumed:
   mutation here — without the retry, 3 of 6 concurrent processes failed outright with
   "database is locked".
 
-The store is in WAL mode so readers never block behind a writer. None of this makes two agents
-pushing simultaneously *sensible* — it makes it safe.
+The store is in WAL mode so readers never block behind a writer. A fifth process reads
+without writing: the openproject-mcp server's hours-ledger tap (when enabled) opens the file
+read-only and queries `Task`/`Entry` for its `hoursLedger` results — best-effort, safe while
+the daemon writes, and absent on any failure. None of this makes two agents pushing
+simultaneously *sensible* — it makes it safe.
 
 Because the server reads `HOURS_PERSON` and the credentials from `hours/.env`, that file must
 be filled in before `log_time` or `push_to_sheet` will work — the server starts fine without
@@ -74,14 +79,15 @@ it, but those tools return an explanatory error rather than guessing your name.
 
 | Tool | Writes | What |
 |---|---|---|
-| `list_projects` | — | Registry, watched repos, hours pushed, valid activities |
+| `list_projects` | — | Registry, watched repos, hours pushed |
+| `list_activities` | — | The fixed activity taxonomy: every acceptable value, what each is for, shorthands |
 | `get_day` | — | Entries for a day, totals, validation warnings, timer state |
 | `sheet_summary` | — | What the spreadsheet tab already says |
 | `task_hours` | local | Whether a task has hours — OpenProject's side and the local sheet's, reported separately, never summed |
 | `log_time` | local | Record time already spent as a draft; taskId attaches it to an OpenProject work package |
 | `start_timer` | local | Begin timing; taskId attaches the result to an OpenProject work package |
 | `stop_timer` | local | Stop and turn elapsed time into a draft |
-| `timer_status` | — | Whether a timer is running |
+| `timer_status` | — | Which timers are running, one line each |
 | `reconstruct_day` | local | Sweep signals, draft the day, explain the reasoning |
 | `edit_entry` | local | Set/fix an entry's note, activity, minutes or taskId before it is pushed |
 | `approve_day` | local | Mark drafts approved |
@@ -89,6 +95,22 @@ it, but those tools return an explanatory error rather than guessing your name.
 
 `project` can be omitted on most tools if you pass `cwd` — the project is resolved from the
 directory through the registry, so a session in `~/Projects/NorthAI` needs no explicit key.
+
+## Activities
+
+The `activity` parameter on `log_time`, `start_timer`, `stop_timer`, and `edit_entry` is
+**not free text** — it is the fixed value for the sheet's Activity/Category column, which
+the pivot tables on every tab pivot on. (The tabs disagree on the header — "Activity" on
+some, "Category" on others — but it is one column with one value set.)
+
+- The full taxonomy with guidance lives behind `list_activities` — call it whenever no
+  activity seems to fit, instead of inventing a label. Unknown labels are refused with an
+  error that repeats the full list.
+- Shorthands resolve too: `dev`, `qa`, `wire`, `db`, `docs`, … — and any unique prefix.
+- A free-form what-did-you-do goes in the `note` parameter, never `activity`. It lands in
+  the sheet's Notes column after the clock range.
+
+`hours activities` on the CLI prints the same taxonomy.
 
 ## The push guard
 

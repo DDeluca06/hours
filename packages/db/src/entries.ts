@@ -8,7 +8,7 @@
 // ---------------------------------------------------------------------------
 
 import { randomUUID } from 'node:crypto';
-import type { ClockRange, Entry, EntryStatus } from '@hours/core';
+import { canonicalActivity, type ClockRange, type Entry, type EntryStatus } from '@hours/core';
 import { prisma, TX_OPTIONS, withBusyRetry } from './client.js';
 import { releaseSignals } from './signals.js';
 
@@ -40,7 +40,14 @@ function toStored(r: {
     person: r.person,
     projectKey: r.projectKey,
     minutes: r.minutes,
-    activity: r.activity as Entry['activity'],
+    // Remapped on read, not left as stored: rows written before an activity was
+    // retired from the taxonomy still carry the old string, and `validateEntries`
+    // treats an off-taxonomy activity as an error. Without this, an entry that
+    // was already *approved* becomes unpushable and has to be hand-edited. An
+    // activity that is neither current nor retired passes through unchanged so
+    // validation still reports it — this remaps history, it does not launder
+    // garbage.
+    activity: (canonicalActivity(r.activity) ?? r.activity) as Entry['activity'],
     ranges: JSON.parse(r.rangesJson) as ClockRange[],
     ...(r.description ? { description: r.description } : {}),
     status: r.status as EntryStatus,

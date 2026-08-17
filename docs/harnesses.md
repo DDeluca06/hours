@@ -119,9 +119,87 @@ runs every sweep:
 `hours collect` reports these separately as `measured spans extended`, because
 nothing new was observed — an existing observation got longer.
 
+### Wakapi — `apps/collector/src/wakapi-heartbeats.ts`
+
+The WakaTime editor extension (installed for VSCodium, Cursor, …) sends a
+heartbeat on every file edit to a self-hosted Wakapi server; the collector
+reads them back. Heartbeats are the densest evidence of any source here — one
+per edit rather than one per save — and unlike a save they are *presence*:
+consecutive heartbeats prove the keyboard was in use between them, so the
+stretch between a run's first and last heartbeat is measured, not guessed.
+
+Heartbeats are never emitted one-per-signal. A typing session produces one
+every few seconds, and thousands of near-identical rows would drown every
+commit in the apportionment — the same failure `claude-sessions.ts` guards
+against. They are folded into stretches: consecutive heartbeats closer than 10
+minutes apart (`WAKAPI_RUN_GAP_MIN`) become one signal from the first
+heartbeat to the last. That is wakatime's own session model, conservative by
+5 minutes. A run is split per project so no signal claims another project's
+minutes, and again at `maxSpanMin` so no single signal asserts a multi-hour
+*measured* span — the same bound the agent-harness sources get.
+
+**Segment identity is stable, and it matters.** The sourceId is the segment's
+first heartbeat, so that heartbeat must not depend on when the sweep ran. The
+window is therefore applied *after* the fold, and to segment ends:
+
+1. Fold every heartbeat in the fetched day, ignoring `since`.
+2. Drop the segments that ended before `since`.
+
+Filtering heartbeats by `since` first — the obvious way, and the way this
+source originally did it — anchored each segment wherever the rolling window
+happened to cut. A 09:00–11:00 typing session became `…:<09:30>` at the 10:00
+sweep, `…:<09:40>` at 10:10, `…:<09:50>` at 10:20: a dozen overlapping
+"measured" signals for one session, none of them dedupable, each one crowding
+real commits out of the apportionment. For the same reason the fetch reaches
+one calendar day further back than `since` — a run that crosses midnight has to
+be anchored at the heartbeat it started on. A kept segment can therefore begin
+*before* `since`; that is the point, not a leak.
+
+The end only grows while the run is open, which `recordSignalSpans` carries
+forward exactly as it does for agent turns. The `maxSpanMin` split is greedy
+from the front for the same reason: an already-emitted segment's end must never
+move backwards, or the stored signal — which never shrinks — would keep minutes
+the next piece also claims. Unlike the harness sources the overflow is not
+discarded: a heartbeat is evidence the keyboard was in use at that moment, so
+the cap bounds what one signal may assert, not how much of the day was worked.
+What bounds *bridged idle* is `WAKAPI_RUN_GAP_MIN`, and nothing else does.
+
+**Heartbeat history is not strictly append-only.** wakatime-cli buffers
+heartbeats while offline and flushes them later via `heartbeats.bulk` with their
+original timestamps, so one genuinely can arrive inside a gap an earlier fetch
+observed. That re-anchors the segment it lands in — a new sourceId for work
+whose earlier signal may already be consumed — and no anchoring scheme can
+prevent it, because the run's start really did move. So the sweep detects it
+instead: `findConsumedSpanOverlaps` reports a fresh signal whose span covers
+already-consumed evidence, capped at five warnings plus a count, and the
+apportionment in `packages/core` is what keeps it from being billed twice.
+
+Only `is_write` file heartbeats are taken. Heartbeats on window focus or file
+open would bill a parked editor as work, so they stay out. A fetch that returns
+heartbeats and can use *none* of them is a warning naming the predicate that ate
+them (`is_write`, the `entity_type`/`type` field, the path): a server or
+extension version that omits one of those fields drops 100% of heartbeats
+through a predicate that looks correct, and the sweep would otherwise report
+`wakapi=0` exactly as it does for a quiet afternoon.
+
+Configuration is env-only: `WAKAPI_URL` and `WAKAPI_API_KEY` (the key is a
+secret; the OpenProject rule applies). The harness toggle is `wakapi` /
+`HOURS_HARNESS_WAKAPI`. Unconfigured is quiet — a machine without a wakapi
+server is the normal case. URL set without the key is one warning, because it
+is exactly the "tracking silently never starts" mistake this source exists to
+catch. A dead server costs one warning line per sweep and the source reports
+empty; nothing here retries.
+
+The compat endpoint has no incremental parameter — every request returns a whole
+day — so the daemon keeps a `WakapiDayCache` across sweeps. Today always goes to
+the server; a finished day may be served from cache for
+`WAKAPI_PAST_DAY_TTL_MS` (30 minutes), which is the longest an offline backfill
+into that day stays invisible. A CLI `hours collect` is a fresh process, so it
+fetches everything.
+
 ## Configuration
 
-All three sources are on by default. `hours.config.json`:
+All sources are on by default. `hours.config.json`:
 
 ```json
 {
@@ -129,6 +207,7 @@ All three sources are on by default. `hours.config.json`:
     "claudeCode": true,
     "openCode": true,
     "editors": true,
+    "wakapi": true,
     "maxSpanMin": 120,
     "remapOpenCodeHome": true,
     "editorHistoryRoots": ["/opt/vscodium/User/History"]
@@ -137,9 +216,10 @@ All three sources are on by default. `hours.config.json`:
 ```
 
 Environment overrides win over the file: `HOURS_HARNESS_CLAUDE`,
-`HOURS_HARNESS_OPENCODE`, `HOURS_HARNESS_EDITORS` (`0`/`false` to disable),
-`HOURS_MAX_SPAN_MIN`, `HOURS_OPENCODE_REMAP_HOME`. Blank counts as unset, not as
-off — a copied `.env.example` must not silently disable collection.
+`HOURS_HARNESS_OPENCODE`, `HOURS_HARNESS_EDITORS`, `HOURS_HARNESS_WAKAPI`
+(`0`/`false` to disable), `HOURS_MAX_SPAN_MIN`, `HOURS_OPENCODE_REMAP_HOME`.
+Blank counts as unset, not as off — a copied `.env.example` must not silently
+disable collection.
 
 `maxSpanMin` bounds the one case where a measured span lies: a tool call parked on
 a permission prompt while you go to lunch is stamped as one continuous turn.

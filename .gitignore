@@ -5,6 +5,10 @@ packages/db/generated/
 *.tsbuildinfo
 .env
 .env.local
+# Machine-local: absolute repo paths and this operator's project registry.
+# Copy hours.config.example.json instead of committing yours.
+hours.config.json
+hours.config.local.json
 *.db
 *.db-journal
 *.db-wal

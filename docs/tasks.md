@@ -165,9 +165,10 @@ on it" report.
 
 ## Flags
 
-- The deployed OpenProject MCP server (as of 2026-08-13) is older than the repo:
-  `op_get_work_package` on it does not reliably surface `spentTime`, and `op_create_work_package`
-  predates the `notify` param. Redeploy before agents lean on the direct detection path.
+- The openproject-mcp repo now surfaces `spentTime` on `op_get_work_package` and carries the
+  read-only `hoursLedger` tap (2026-08-14). Whether the **deployed** instance matches the repo
+  is a separate question — verify with one `op_get_work_package` call before agents lean on the
+  direct detection path.
 - `op_log_time` always attributes to the API key's own user — OpenProject time entries can
   never be logged on someone else's behalf.
 - Ref parsing is only as good as naming discipline; that is why slice 3 requires agreement

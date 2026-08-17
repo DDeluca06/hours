@@ -81,11 +81,30 @@ function withRepoConfigFile(content: string, fn: () => void): void {
   });
 }
 
+// "No config file" has to be pointed at a path that does not exist, not just
+// left alone: the loader falls back to the repo root, where the operator's own
+// hours.config.json lives, and these assertions then read their machine's
+// project registry instead of nothing.
+function withNoRepoConfigFile(fn: () => void): void {
+  withTempDir((dir) => {
+    process.env['HOURS_CONFIG_FILE'] = join(dir, 'absent.config.json');
+    resetConfigCache();
+    try {
+      fn();
+    } finally {
+      delete process.env['HOURS_CONFIG_FILE'];
+      resetConfigCache();
+    }
+  });
+}
+
 describe('openproject config', () => {
   it('is all-undefined with no env and no file section', () => {
     delete process.env['OPENPROJECT_URL'];
     delete process.env['OPENPROJECT_API_KEY'];
-    expect(loadConfig().openproject).toEqual({ url: undefined, apiKey: undefined, projects: undefined });
+    withNoRepoConfigFile(() => {
+      expect(loadConfig().openproject).toEqual({ url: undefined, apiKey: undefined, projects: undefined });
+    });
   });
 
   it('treats empty OPENPROJECT_URL/API_KEY as unset (copied .env.example)', () => {
@@ -135,8 +154,10 @@ describe('openproject config', () => {
   it('is a no-throw load when hours.config.json is absent', () => {
     delete process.env['OPENPROJECT_URL'];
     delete process.env['OPENPROJECT_API_KEY'];
-    expect(() => loadConfig()).not.toThrow();
-    expect(loadConfig().openproject).toEqual({ url: undefined, apiKey: undefined, projects: undefined });
+    withNoRepoConfigFile(() => {
+      expect(() => loadConfig()).not.toThrow();
+      expect(loadConfig().openproject).toEqual({ url: undefined, apiKey: undefined, projects: undefined });
+    });
   });
 });
 
@@ -206,6 +227,7 @@ describe('harness config', () => {
       claudeCode: true,
       openCode: true,
       editors: true,
+      wakapi: true,
       maxSpanMin: 120,
       remapOpenCodeHome: true,
       editorHistoryRoots: undefined,

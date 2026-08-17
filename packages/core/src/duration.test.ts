@@ -121,7 +121,7 @@ describe('range arithmetic', () => {
   });
 
   it('formats ranges back into the sheet convention', () => {
-    expect(formatClockRanges([{ startMin: 540, endMin: 645 }])).toBe('9:00 - 10:45');
-    expect(formatClock(14 * 60 + 45)).toBe('14:45');
+    expect(formatClockRanges([{ startMin: 540, endMin: 645 }])).toBe('9:00 AM - 10:45 AM');
+    expect(formatClock(14 * 60 + 45)).toBe('2:45 PM');
   });
 });

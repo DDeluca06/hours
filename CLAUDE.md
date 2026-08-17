@@ -33,7 +33,7 @@ passed to `PrismaClient` (runtime), **not** in the schema's `datasource` block. 
 ```bash
 pnpm install
 pnpm db:generate && pnpm db:push     # from the repo root
-pnpm test                            # 248 tests
+pnpm test                            # 307 tests
 pnpm -r typecheck
 pnpm lint
 
@@ -79,6 +79,14 @@ These are load-bearing. Breaking one is a correctness bug, not a style question.
    *unconsumed* signal because a turn's end is not knowable while the turn is running. It moves
    forward only, so it stays idempotent; a consumed signal is never touched, or its entry's
    duration would disagree with its own evidence. See `docs/harnesses.md`.
+
+   A corollary that is easy to break: **a sourceId may not depend on the collection window.**
+   A source that anchors its id at the start of a run must fold the whole fetched period and
+   window on segment *ends*, or a sliding `since` re-anchors the same work every sweep — see
+   the header of `wakapi-heartbeats.ts` for the concrete failure. Where evidence can genuinely
+   arrive late (an offline wakatime-cli flushing buffered heartbeats), the anchor really does
+   move and idempotency cannot be preserved; `findConsumedSpanOverlaps` reports it rather than
+   letting it pass silently.
 3. **Attributed work is arbitrated before unattributed work**, and unattributed blocks are
    clipped against what attributed blocks claimed. Otherwise a long session in an unwatched
    directory crowds out a real commit and that time disappears.
@@ -86,17 +94,29 @@ These are load-bearing. Breaking one is a correctness bug, not a style question.
    immutable locally.
 5. **Only `Activity` values from the sheet's taxonomy are ever written.** Anything else breaks
    the pivot tables sitting to the right of the data on every tab. `validateEntries` treats
-   this as an error, not a warning.
+   this as an error, not a warning. Shrinking `ACTIVITIES` therefore needs a compatibility
+   entry in `LEGACY_ACTIVITIES` — stored rows still carry the retired string, and entries read
+   through `packages/db` are remapped so an already-approved entry does not become unpushable.
+   An activity that is neither current nor retired still fails validation; the remap covers
+   history, not typos.
 6. **Appends are bounded to the tab's data columns.** `discoverLayout` computes `dataWidth`
    precisely so `values.append` cannot treat a pivot table as part of the table to extend.
 7. **The sheet is append-only.** No updates, no deletes — other people's rows live there.
 8. **Several processes share the store.** The CLI, Claude Code's MCP server, OpenCode's, and
    the collector daemon all write to one SQLite file, so no invariant may rest on a
-   read-then-write pair in a single process. One open timer is a unique index on
-   `Timer.openKey`; stopping is conditional on `stoppedAt: null`; pushing takes a lease on
+   read-then-write pair in a single process. One open timer *per project* is a unique index
+   on `Timer.openKey` — the open timer's row carries its project key there, so timers on
+   different projects run side by side while a second start on the same project replaces
+   the first. Because two contracts must never be billed the same minute, `startTimer`
+   returns the other projects' still-running timers as `concurrent` and both surfaces say so
+   at start time, and an untargeted `stop`/`cancel` **refuses** rather than guessing when
+   more than one is open (`resolveTimerTarget`) — picking the newest silently banked one
+   contract's afternoon against the other. Stopping is conditional on `stoppedAt: null`; pushing takes a lease on
    each entry before the append. Every mutation in `packages/db` goes through
    `withBusyRetry` — SQLite returns SQLITE_BUSY without waiting when a transaction upgrades
-   a read lock, so the retry lives outside the transaction. See `docs/mcp.md`.
+   a read lock, so the retry lives outside the transaction. A fifth process *reads* without
+   writing: openproject-mcp's hours-ledger tap opens `hours.db` read-only and queries
+   `Task`/`Entry`, so those tables stay plain-queryable by a foreign process. See `docs/mcp.md`.
 
 ## Sheet conventions
 
@@ -129,3 +149,8 @@ Discovered at runtime, never hard-coded, because the tabs disagree with each oth
 `lp-internal-ai-v1/connectors/google-sheets/src/sync-hours.ts` reads these same two tabs into
 an `hour_logs` table for reporting. That is the read-for-analytics path; this repo is the
 capture-and-write path. Don't duplicate either in the other.
+
+`~/Projects/OpenProject` (openproject-mcp) reads this store read-only when enabled
+(`OPENPROJECT_HOURS_DB`) for its `hoursLedger` on `op_get_work_package`/`op_log_time`; this
+repo talks to the OpenProject API directly through `connectors/openproject` (`task_hours`,
+push write-through). Best-effort both ways, never a dependency.

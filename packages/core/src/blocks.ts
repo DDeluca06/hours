@@ -41,6 +41,7 @@ export type SignalKind =
   | 'file_edit'
   | 'claude_session'
   | 'opencode_session'
+  | 'heartbeat'
   | 'calendar'
   | 'manual';
 
@@ -122,6 +123,7 @@ const KIND_WEIGHT: Record<SignalKind, number> = {
   file_edit: 1,
   claude_session: 1,
   opencode_session: 1,
+  heartbeat: 1,
 };
 
 /** Weight floor for a measured span — see `signalWeight`. */

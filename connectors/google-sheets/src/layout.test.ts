@@ -101,7 +101,7 @@ describe('buildRowCells', () => {
     person: 'Demitri',
     hours: '1:45:00',
     activity: 'Development',
-    notes: '9:00 - 10:45',
+    notes: '9:00 AM - 10:45 AM',
   };
 
   it('places cells in the tab’s own column order', () => {
@@ -111,7 +111,7 @@ describe('buildRowCells', () => {
       'Demitri',
       '1:45:00',
       'Development',
-      '9:00 - 10:45',
+      '9:00 AM - 10:45 AM',
     ]);
   });
 
@@ -119,6 +119,6 @@ describe('buildRowCells', () => {
     const l = discoverLayout('LP Internal AI', categoryNoNotes)!;
     const cells = buildRowCells(l, row);
     expect(cells).toHaveLength(4);
-    expect(cells).not.toContain('9:00 - 10:45');
+    expect(cells).not.toContain('9:00 AM - 10:45 AM');
   });
 });

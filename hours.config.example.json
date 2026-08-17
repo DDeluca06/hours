@@ -1,0 +1,32 @@
+{
+  "person": "Your Name",
+  "workday": { "startMin": 540, "endMin": 900, "gapMin": 25 },
+  "projects": [
+    {
+      "key": "north10",
+      "name": "North10AI",
+      "sheetTab": "North10AI",
+      "repoPaths": ["/absolute/path/to/NorthAI"],
+      "contractHours": 533
+    },
+    {
+      "key": "lp",
+      "name": "LP Internal AI",
+      "sheetTab": "LP Internal AI",
+      "repoPaths": ["/absolute/path/to/lp-internal-ai-v1"]
+    }
+  ],
+  "harnesses": {
+    "claudeCode": true,
+    "openCode": true,
+    "editors": true,
+    "wakapi": true,
+    "maxSpanMin": 120
+  },
+  "openproject": {
+    "projects": {
+      "north10": "north10-ai",
+      "lp": "internal-ai-integrations"
+    }
+  }
+}
