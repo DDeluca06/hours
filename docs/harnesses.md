@@ -56,23 +56,36 @@ Two things worth knowing:
 
 ### OpenCode — `apps/collector/src/opencode-sessions.ts`
 
-One JSON file per message under
-`~/.local/share/opencode/storage/message/<sessionID>/<messageID>.json`. An
-assistant message carries both `time.created` and `time.completed`, which is a
-measured turn duration handed over directly — the best evidence of any source here,
-Claude Code included, where the end has to be reconstructed.
+OpenCode 1.18+ keeps its sessions and messages in a SQLite database at
+`~/.local/share/opencode/opencode.db`: one row per session in `session_v2`
+(directory, title, `time_updated`), one row per message in `session_message`
+with the message JSON in `data`. An assistant message carries both
+`data.time.created` and `data.time.completed`, which is a measured turn
+duration handed over directly — the best evidence of any source here, Claude
+Code included, where the end has to be reconstructed.
+
+Pre-1.18 installs kept one JSON file per message under
+`~/.local/share/opencode/storage/message/<sessionID>/<messageID>.json` with the
+same shape inside. The legacy reader is the fallback: a missing database is a
+missing store, not an error, so a machine on the old layout still sweeps.
+
+Attribution comes from the message's `data.path.cwd`, falling back to the
+session's `path` and then its `directory`. Sessions are filtered on
+`time_updated` before their messages are read, so a sweep is a handful of
+small queries rather than one per message ever written.
 
 Attribution comes from the message's `path.cwd`, falling back to the session's
 `directory`. Sessions are filtered on `time.updated` before their message
 directory is opened, so a sweep is a handful of small reads rather than one per
 message ever written.
 
-**Foreign home directories.** This storage is routinely synced or restored between
-machines and its paths are absolute, so `localizeHome` rewrites another machine's
-home segment onto this one. Without it, every restored session lands unattributed.
-The project-relative part still has to match a registered repo path, so the failure
-mode is a missing attribution, not a wrong one — and review catches the rest. Turn
-it off with `HOURS_OPENCODE_REMAP_HOME=0`.
+**Foreign home directories.** The database is routinely synced or restored
+between machines and the paths inside it are absolute, so `localizeHome`
+rewrites another machine's home segment onto this one. Without it, every
+restored session lands unattributed. The project-relative part still has to
+match a registered repo path, so the failure mode is a missing attribution,
+not a wrong one — and review catches the rest. Turn it off with
+`HOURS_OPENCODE_REMAP_HOME=0`.
 
 ### Editors — `apps/collector/src/editor-history.ts`
 

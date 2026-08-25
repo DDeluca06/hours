@@ -19,6 +19,10 @@
     "@hours/config": "workspace:*",
     "@hours/connector-openproject": "workspace:*",
     "@hours/core": "workspace:*",
-    "@hours/lib-db": "workspace:*"
+    "@hours/lib-db": "workspace:*",
+    "better-sqlite3": "12.11.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0"
   }
 }

@@ -1,20 +1,28 @@
 // ---------------------------------------------------------------------------
 // OpenCode sessions as a signal source.
 //
-// OpenCode keeps one JSON file per message under
-// ~/.local/share/opencode/storage/message/<sessionID>/<messageID>.json, and an
-// assistant message records both `time.created` and `time.completed`. That is a
-// measured turn duration handed to us directly — better evidence than any other
-// source here, Claude Code included, where the end has to be reconstructed from
-// the timestamp of the last line written.
+// OpenCode 1.18+ keeps its sessions and messages in a SQLite database at
+// ~/.local/share/opencode/opencode.db: `session_v2` holds one row per session
+// (directory, title, time_updated), `session_message` one row per message with
+// the message JSON in `data`. An assistant message records both
+// `data.time.created` and `data.time.completed` — a measured turn duration
+// handed to us directly, better evidence than any other source here, Claude
+// Code included, where the end has to be reconstructed from the timestamp of
+// the last line written.
 //
-// Attribution comes from the assistant message's `path.cwd`, falling back to the
-// session's `directory`. Sessions are filtered by `time.updated` before their
-// message directory is opened, so a sweep costs a handful of small reads rather
-// than one per message ever written.
+// Versions before 1.18 kept one JSON file per message under
+// ~/.local/share/opencode/storage/message/<sessionID>/<messageID>.json with the
+// same shape inside. The legacy reader is kept as the fallback for machines
+// still on those versions: a missing database is a normal case, not an error.
+//
+// Attribution comes from the message's `data.path.cwd`, falling back to the
+// session's `path` and then its `directory`. Sessions are filtered by
+// `time_updated` before their messages are read, so a sweep costs a handful of
+// small queries rather than one per message ever written.
 // ---------------------------------------------------------------------------
 
 import { readdir, readFile, stat } from 'node:fs/promises';
+import Database from 'better-sqlite3';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -25,6 +33,7 @@ import {
 } from '@hours/core';
 
 export const OPENCODE_STORAGE = join(homedir(), '.local', 'share', 'opencode', 'storage');
+export const OPENCODE_DB = join(homedir(), '.local', 'share', 'opencode', 'opencode.db');
 
 interface StoredSession {
   id?: string;
@@ -41,14 +50,38 @@ interface StoredMessage {
   path?: { cwd?: string; root?: string };
 }
 
+/** One row of `session_v2`. */
+interface DbSession {
+  id: string;
+  directory: string | null;
+  path: string | null;
+  title: string | null;
+  time_updated: number | null;
+}
+
+/** One row of `session_message`. */
+interface DbMessage {
+  id: string;
+  session_id: string;
+  type: string;
+  time_created: number | null;
+  data: string | null;
+}
+
+function fileExists(path: string): Promise<boolean> {
+  return stat(path)
+    .then((s) => s.isFile())
+    .catch(() => false);
+}
+
 /**
  * Rewrite another machine's home directory onto this one.
  *
- * OpenCode's storage directory is routinely synced or restored between machines,
- * and the paths inside it are absolute. The real data this was built against is
- * full of `/home/demitridmili/...` on a box whose home is `/home/mili` — without
- * this, every one of those sessions lands unattributed and has to be assigned by
- * hand during review.
+ * OpenCode's database is routinely synced or restored between machines, and the
+ * paths inside it are absolute. The real data this was built against is full of
+ * `/home/demitridmili/...` on a box whose home is `/home/mili` — without this,
+ * every one of those sessions lands unattributed and has to be assigned by hand
+ * during review.
  *
  * Only the home segment is replaced, so the project-relative part still has to
  * match a registered repo path. A stranger's home would have to contain a
@@ -75,8 +108,10 @@ async function readJson<T>(path: string): Promise<T | null> {
 export interface CollectOpenCodeOptions {
   since: Date;
   projects: readonly ProjectDef[];
-  /** Override the storage root. Tests only. */
+  /** Override the legacy JSON storage root. Tests only. */
   root?: string;
+  /** Override the SQLite database path. Defaults to `OPENCODE_DB`. */
+  dbPath?: string;
   /** Cap on a single turn's measured span. Defaults to `DEFAULT_MAX_SPAN_MIN`. */
   maxSpanMin?: number;
   /** Map a foreign home directory onto this one. Defaults to true. */
@@ -86,10 +121,129 @@ export interface CollectOpenCodeOptions {
 export async function collectOpenCodeSignals(
   opts: CollectOpenCodeOptions,
 ): Promise<Signal[]> {
-  const root = opts.root ?? OPENCODE_STORAGE;
+  const dbPath = opts.dbPath ?? OPENCODE_DB;
   const maxSpanMin = opts.maxSpanMin ?? DEFAULT_MAX_SPAN_MIN;
   const remap = opts.remapHome ?? true;
   const sinceMs = opts.since.getTime();
+
+  // Newer OpenCode writes everything to SQLite; older ones kept JSON files.
+  // The database wins when both exist, because it is the store actually being
+  // written — reading the dead tree would duplicate nothing (different
+  // sourceIds) but would waste a sweep on months of stable rows.
+  if (await fileExists(dbPath)) {
+    try {
+      return collectFromDb(opts, { dbPath, maxSpanMin, remap, sinceMs });
+    } catch {
+      // A half-written or foreign reader view of the db is a missing store:
+      // the other sources stand alone.
+      return [];
+    }
+  }
+  return collectFromLegacyStorage(opts, { maxSpanMin, remap, sinceMs });
+}
+
+// ---------------------------------------------------------------------------
+// SQLite store (OpenCode 1.18+)
+// ---------------------------------------------------------------------------
+
+function collectFromDb(
+  opts: CollectOpenCodeOptions,
+  cfg: { dbPath: string; maxSpanMin: number; remap: boolean; sinceMs: number },
+): Signal[] {
+  const { dbPath, maxSpanMin, remap, sinceMs } = cfg;
+
+  // Read-only: this database belongs to a running OpenCode process, and the
+  // collector must never write to another application's store.
+  const db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 5_000 });
+  try {
+    db.pragma('busy_timeout = 5000');
+    // A pre-1.18 database has no `session_v2`; treat it as empty rather than
+    // failing the whole sweep.
+    const sessions = (db.prepare(
+      `SELECT id, directory, path, title, time_updated
+         FROM session_v2 WHERE time_updated >= ?`,
+    ).all(sinceMs) as unknown as DbSession[]).filter((s) => s.id);
+
+    if (sessions.length === 0) return [];
+
+    const byId = new Map(sessions.map((s) => [s.id, s]));
+    const messages = (db.prepare(
+      `SELECT id, session_id, type, time_created, data
+         FROM session_message WHERE time_created >= ?`,
+    ).all(sinceMs) as unknown as DbMessage[]).filter((m) => m.id);
+
+    const out: Signal[] = [];
+    for (const msg of messages) {
+      const session = byId.get(msg.session_id);
+      // A message whose session row predates the window cannot be in it; the
+      // session query is the cheap filter (same as the legacy reader).
+      if (!session) continue;
+      const created = typeof msg.time_created === 'number' ? msg.time_created : 0;
+      if (created < sinceMs) continue;
+
+      const parsed = parseMessageData(msg.data);
+      if (!parsed) continue;
+      const dataCreated = parsed.time?.created;
+      const atMs = typeof dataCreated === 'number' ? dataCreated : created;
+      if (atMs < sinceMs) continue;
+
+      const at = new Date(atMs);
+      // `path` is routinely an empty string in the DB (not null), so a plain
+      // `??` chain would stop on it and drop the attribution the session's
+      // `directory` carries. Pick the first non-empty candidate.
+      const cwdPath =
+        parsed.path?.cwd ?? [session.path, session.directory].find((p) => !!p?.trim()) ?? '';
+      const cwd = cwdPath ? (remap ? localizeHome(cwdPath) : cwdPath) : '';
+      const projectKey = cwd ? (projectForPath(cwd, opts.projects)?.key ?? null) : null;
+
+      const signal: Signal = {
+        sourceId: `opencode:${session.id}:${msg.id}`,
+        kind: 'opencode_session',
+        at,
+        projectKey,
+      };
+
+      // Same convention as the legacy reader: the session title rides on the
+      // prompts alone, not on the far more numerous assistant messages.
+      if (msg.type === 'user') {
+        const title = (session.title ?? '').trim();
+        if (title) signal.subject = title;
+      }
+
+      const completed = parsed.time?.completed;
+      if (typeof completed === 'number' && completed > atMs) {
+        signal.until = new Date(Math.min(completed, atMs + maxSpanMin * 60_000));
+      }
+
+      out.push(signal);
+    }
+    return out;
+  } finally {
+    db.close();
+  }
+}
+
+function parseMessageData(data: string | null): StoredMessage | null {
+  if (!data) return null;
+  try {
+    const parsed = JSON.parse(data) as { time?: unknown; path?: unknown };
+    if (parsed && typeof parsed === 'object') return parsed as StoredMessage;
+  } catch {
+    // Half-written while the session is running right now.
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Legacy JSON store (OpenCode < 1.18)
+// ---------------------------------------------------------------------------
+
+async function collectFromLegacyStorage(
+  opts: CollectOpenCodeOptions,
+  cfg: { maxSpanMin: number; remap: boolean; sinceMs: number },
+): Promise<Signal[]> {
+  const root = opts.root ?? OPENCODE_STORAGE;
+  const { maxSpanMin, remap, sinceMs } = cfg;
 
   const sessionRoot = join(root, 'session');
   let groups: string[];
@@ -116,14 +270,16 @@ export async function collectOpenCodeSignals(
       // window cannot hold a message inside it either.
       if ((session.time?.updated ?? 0) < sinceMs) continue;
 
-      out.push(...(await collectSession(root, session, opts.projects, { maxSpanMin, remap, sinceMs })));
+      out.push(
+        ...(await collectLegacySession(root, session, opts.projects, { maxSpanMin, remap, sinceMs })),
+      );
     }
   }
 
   return out;
 }
 
-async function collectSession(
+async function collectLegacySession(
   root: string,
   session: StoredSession,
   projects: readonly ProjectDef[],
@@ -182,8 +338,12 @@ async function collectSession(
   return signals;
 }
 
-/** Whether this machine has any OpenCode storage worth sweeping. */
-export async function hasOpenCodeStorage(root = OPENCODE_STORAGE): Promise<boolean> {
+/** Whether this machine has any OpenCode store worth sweeping. */
+export async function hasOpenCodeStorage(
+  root = OPENCODE_STORAGE,
+  dbPath = OPENCODE_DB,
+): Promise<boolean> {
+  if (await fileExists(dbPath)) return true;
   try {
     return (await stat(join(root, 'session'))).isDirectory();
   } catch {
