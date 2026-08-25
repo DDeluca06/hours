@@ -70,6 +70,31 @@ describe('summarizeSubjects', () => {
     expect(summarizeSubjects([])).toBeUndefined();
     expect(summarizeSubjects(['feat:'])).toBeUndefined();
   });
+
+  it('drops raw prompt chatter from the note', () => {
+    expect(
+      summarizeSubjects([
+        "Let's look at where we left off yesterday and plan the day",
+        'feat(grants): real matcher',
+      ]),
+    ).toBe('real matcher');
+    expect(
+      summarizeSubjects(["Let's review the backlog", 'docs: playbook proposal']),
+    ).toBe('playbook proposal');
+  });
+
+  it('drops interrupted-marker and continuation lines', () => {
+    expect(summarizeSubjects(['[Request interrupted by user]', 'docs: playbook proposal'])).toBe(
+      'playbook proposal',
+    );
+    expect(
+      summarizeSubjects(['This session is being continued from a previous co…', 'fix: acl rows']),
+    ).toBe('acl rows');
+  });
+
+  it('leaves the note undefined when every subject is chatter', () => {
+    expect(summarizeSubjects(["Let's evaluate today's work packages"])).toBeUndefined();
+  });
 });
 
 describe('validateEntries', () => {

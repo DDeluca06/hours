@@ -82,6 +82,15 @@ export function entryFromBlock(
 }
 
 /**
+ * Subjects that describe the harness session, not the work: raw prompts
+ * ("Let's ..."), interrupted-marker lines, and continuation headers. They are
+ * the most common subject on agent-driven days and say nothing about what was
+ * done, so they never make it into a Notes cell. When every subject is chatter
+ * the description is left undefined and the review step asks for one instead.
+ */
+const CHATTER: RegExp[] = [/^let'?s\b/i, /^\[request /i, /^this session is being continued/i];
+
+/**
  * Compress a run's subjects into one short Notes tail.
  *
  * Commit subjects are the best free description of what was actually done, but
@@ -90,7 +99,10 @@ export function entryFromBlock(
  */
 export function summarizeSubjects(subjects: readonly string[], max = 2): string | undefined {
   if (subjects.length === 0) return undefined;
-  const cleaned = subjects.map((s) => s.replace(/^\w+(?:\([^)]*\))?!?:\s*/, '').trim()).filter(Boolean);
+  const cleaned = subjects
+    .map((s) => s.replace(/^\w+(?:\([^)]*\))?!?:\s*/, '').trim())
+    .filter(Boolean)
+    .filter((s) => !CHATTER.some((re) => re.test(s)));
   if (cleaned.length === 0) return undefined;
   const head = cleaned.slice(0, max).join('; ');
   const rest = cleaned.length - max;
