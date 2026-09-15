@@ -43,12 +43,18 @@ export interface Entry {
   taskId?: string;
 }
 
-/** The four columns the writer appends, in sheet order. */
+/**
+ * The columns the writer appends, in sheet order. `project` is only ever
+ * written on a tab that has a Project column (currently just "Inc Ops");
+ * `buildRowCells` drops it on every other tab the same way it already drops
+ * `notes` on a tab with no Notes column.
+ */
 export interface SheetRow {
   date: string;
   person: string;
   hours: string;
   activity: string;
+  project: string;
   notes: string;
 }
 
@@ -109,8 +115,19 @@ export function summarizeSubjects(subjects: readonly string[], max = 2): string 
   return rest > 0 ? `${head} (+${rest} more)` : head;
 }
 
-/** Render an Entry into the exact cells to append. */
-export function toSheetRow(entry: Entry, date = new Date(`${entry.day}T12:00:00`)): SheetRow {
+/**
+ * Render an Entry into the exact cells to append.
+ *
+ * `projectLabel` is resolved by the caller from the entry's `projectKey`
+ * (`ProjectDef.sheetProjectLabel`) — this function stays pure/config-free, so
+ * it just places whatever string it's handed. Defaults to `''`, which
+ * `buildRowCells` never writes on a tab with no Project column anyway.
+ */
+export function toSheetRow(
+  entry: Entry,
+  date = new Date(`${entry.day}T12:00:00`),
+  projectLabel = '',
+): SheetRow {
   const rangeText = formatClockRanges(entry.ranges);
   // The sheet has no task column; Notes is the only slot, so the ref goes at
   // the front, same as clock ranges. Trimmed: with no range and no
@@ -122,6 +139,7 @@ export function toSheetRow(entry: Entry, date = new Date(`${entry.day}T12:00:00`
     person: entry.person,
     hours: formatMinutesAsDuration(entry.minutes),
     activity: entry.activity,
+    project: projectLabel,
     notes,
   };
 }

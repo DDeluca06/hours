@@ -33,7 +33,7 @@ passed to `PrismaClient` (runtime), **not** in the schema's `datasource` block. 
 ```bash
 pnpm install
 pnpm db:generate && pnpm db:push     # from the repo root
-pnpm test                            # 307 tests
+pnpm test                            # 328 tests
 pnpm -r typecheck
 pnpm lint
 

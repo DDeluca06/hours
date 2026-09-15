@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_MAX_SPAN_MIN,
   DEFAULT_PROJECTS,
+  DEFAULT_RATE_USD_PER_HOUR,
   DEFAULT_WORKDAY,
   type ProjectDef,
   type WorkdayPolicy,
@@ -92,6 +93,11 @@ export interface HoursConfig {
   databaseUrl: string;
   /** Keep inferred work that fell outside the 9–3 window. */
   allowOutsideWorkday: boolean;
+  /**
+   * Flat billing rate in dollars per hour, used by the invoice report only.
+   * Not a secret and not per-project — both engagements bill the same.
+   */
+  rateUsdPerHour: number;
 }
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -102,6 +108,7 @@ interface FileConfig {
   workday?: Partial<WorkdayPolicy>;
   harnesses?: Partial<HarnessConfig>;
   allowOutsideWorkday?: boolean;
+  rateUsdPerHour?: number;
   /**
    * Only `projects` belongs here. `url`/`apiKey` are env-only — a secret in
    * the JSON file is ignored, not read (same rule as the Google credentials).
@@ -159,6 +166,11 @@ function resolveHarnesses(
   };
 }
 
+function resolveRate(envValue: string | undefined, fileValue: number | undefined): number {
+  const raw = Number(envValue ?? fileValue ?? DEFAULT_RATE_USD_PER_HOUR);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_RATE_USD_PER_HOUR;
+}
+
 let cached: HoursConfig | null = null;
 
 function defaultTokenPath(): string {
@@ -201,6 +213,10 @@ export function loadConfig(): HoursConfig {
     harnesses: resolveHarnesses(file.harnesses, env),
     databaseUrl: env['DATABASE_URL'] || `file:${resolve(REPO_ROOT, 'hours.db')}`,
     allowOutsideWorkday: env['HOURS_ALLOW_OUTSIDE'] === '1' || file.allowOutsideWorkday === true,
+    // Falls back rather than throwing, like maxSpanMin above: a garbled rate
+    // must not take down `hours log`, and a rate of 0 or NaN on an invoice is
+    // worse than the documented default.
+    rateUsdPerHour: resolveRate(env['HOURS_RATE_USD'], file.rateUsdPerHour),
   };
   return cached;
 }

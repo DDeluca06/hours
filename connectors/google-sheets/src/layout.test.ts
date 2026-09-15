@@ -14,6 +14,13 @@ const categoryNoNotes = [
   ['8/4', 'Demitri', '1:45:00', 'Development'],
 ];
 
+// "Inc Ops" rolls up ops/nixos/lpcli, so it carries a Project dropdown between
+// Activity and Notes that no other tab has.
+const withProject = [
+  ['Date', 'Person', 'Hours', 'Activity', 'Project', 'Notes'],
+  ['9/11', 'Demitri', '1:30:00', 'Development', 'NixOS', 'Fixed tailnet ACL'],
+];
+
 // One tab parks a contract label immediately right of Category, and every tab
 // has pivot headers a few columns over.
 const withPivots = [
@@ -42,13 +49,28 @@ describe('discoverLayout', () => {
     const l = discoverLayout('LP Internal AI', categoryNoNotes);
     expect(l?.activityHeader).toBe('Category');
     expect(l?.activityCol).toBe(3);
+    expect(l?.projectCol).toBeNull();
     expect(l?.notesCol).toBeNull();
     expect(l?.dataWidth).toBe(4);
+  });
+
+  it('finds a Project column between Activity and Notes, and still finds Notes past it', () => {
+    const l = discoverLayout('Inc Ops', withProject);
+    expect(l?.activityCol).toBe(3);
+    expect(l?.projectCol).toBe(4);
+    expect(l?.notesCol).toBe(5);
+    expect(l?.dataWidth).toBe(6);
+  });
+
+  it('leaves projectCol null on every tab without a Project header', () => {
+    const l = discoverLayout('North10AI', withNotes);
+    expect(l?.projectCol).toBeNull();
   });
 
   // Appending into a pivot table would corrupt live formulas the team reads.
   it('never counts a pivot table or contract label as the data block', () => {
     const l = discoverLayout('Some Tab', withPivots);
+    expect(l?.projectCol).toBeNull();
     expect(l?.notesCol).toBeNull();
     expect(l?.dataWidth).toBe(4);
     expect(appendRange(l!, 0)).toBe("'Some Tab'!A1:D1");
@@ -101,6 +123,7 @@ describe('buildRowCells', () => {
     person: 'Demitri',
     hours: '1:45:00',
     activity: 'Development',
+    project: '',
     notes: '9:00 AM - 10:45 AM',
   };
 
@@ -120,5 +143,23 @@ describe('buildRowCells', () => {
     const cells = buildRowCells(l, row);
     expect(cells).toHaveLength(4);
     expect(cells).not.toContain('9:00 AM - 10:45 AM');
+  });
+
+  it('places project in its own column on a tab that has one', () => {
+    const l = discoverLayout('Inc Ops', withProject)!;
+    expect(buildRowCells(l, { ...row, project: 'NixOS' })).toEqual([
+      '8/12',
+      'Demitri',
+      '1:45:00',
+      'Development',
+      'NixOS',
+      '9:00 AM - 10:45 AM',
+    ]);
+  });
+
+  it('drops project when the tab has no Project column', () => {
+    const l = discoverLayout('North10AI', withNotes)!;
+    const cells = buildRowCells(l, { ...row, project: 'NixOS' });
+    expect(cells).not.toContain('NixOS');
   });
 });

@@ -17,13 +17,17 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { loadConfig, requirePushConfig } from '@hours/config';
 import {
+  billableHours,
+  computeInvoice,
   formatClockRanges,
   formatMinutesShort,
+  formatUsd,
   localDayKey,
   projectByKey,
   projectForPath,
   resolveActivity,
   toSheetRow,
+  topLevelProjects,
   validateEntries,
   ACTIVITIES,
   activityListText,
@@ -53,7 +57,13 @@ import {
   type StoredEntry,
 } from '@hours/lib-db';
 import { reconstruct, sweep } from '@hours/collector';
-import { previewPush, pushEntries, readTab, summarize } from '@hours/connector-google-sheets';
+import {
+  previewPush,
+  pushEntries,
+  readTab,
+  rowsInMonth,
+  summarize,
+} from '@hours/connector-google-sheets';
 import {
   createTimeEntry,
   getWorkPackage,
@@ -144,7 +154,8 @@ server.registerTool(
       const pushed = await pushedHours(p.key);
       lines.push(
         `${p.key}  "${p.name}"  → tab "${p.sheetTab}"  ${pushed.toFixed(2)}h pushed` +
-          (p.contractHours !== undefined ? `  (contract ${p.contractHours}h)` : ''),
+          (p.contractHours !== undefined ? `  (contract ${p.contractHours}h)` : '') +
+          (p.parent !== undefined ? `  (sub-project of "${p.parent}")` : ''),
       );
       for (const repo of p.repoPaths) lines.push(`    watches ${repo}`);
     }
@@ -254,6 +265,108 @@ server.registerTool(
       }
       if (totals.unparsedRows.length) {
         lines.push('', `unparsable Hours in rows: ${totals.unparsedRows.join(', ')}`);
+      }
+      return text(lines.join('\n'));
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+/**
+ * Money is a report, never a write. This tool reads the same two tabs
+ * `sheet_summary` reads and prices them; nothing in the invoice path touches
+ * the sheet, the local store, or OpenProject, so it needs no confirm gate.
+ */
+server.registerTool(
+  'invoice_summary',
+  {
+    title: 'Invoice for a month',
+    description:
+      "Billable hours and pay for a calendar month, read from the shared sheet at the configured flat rate. Reports the whole team's total, our share of it, and a per-project and per-person breakdown. Read-only. " +
+      'A sub-project (one sharing its parent\'s tab, e.g. internal tooling billed under "Internal Operations") is rolled into its parent by default — name it explicitly in `projects` to break it out, though its numbers are identical to its parent\'s since they share one tab.',
+    inputSchema: {
+      month: z.string().optional().describe('YYYY-MM. Defaults to the current month.'),
+      person: z
+        .string()
+        .optional()
+        .describe("Whose hours count as ours. Defaults to the configured person."),
+      rateUsdPerHour: z
+        .number()
+        .positive()
+        .optional()
+        .describe('Override the configured flat hourly rate, in dollars.'),
+      projects: z
+        .array(z.string())
+        .optional()
+        .describe(
+          'Project keys to include. Defaults to every top-level project (sub-projects sharing a parent\'s tab are already counted through it).',
+        ),
+    },
+  },
+  async ({ month, person, rateUsdPerHour, projects }) => {
+    try {
+      const { sheetId, person: configuredPerson } = requirePushConfig(cfg);
+      const target = month ?? localDayKey(new Date()).slice(0, 7);
+      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(target)) {
+        return fail(`${target} is not a YYYY-MM month`);
+      }
+      const who = person ?? configuredPerson;
+      const rate = rateUsdPerHour ?? cfg.rateUsdPerHour;
+      // Explicit keys are honored as-is — asking for a sub-project by name is a
+      // deliberate "show me that tab" request. The default list is deduped to
+      // one entry per tab, or a sub-project's rows would be summed again under
+      // every project registered against its parent's tab.
+      const wanted = projects?.length
+        ? projects.map((k) => resolveProject(k))
+        : topLevelProjects(cfg.projects);
+
+      let undatedYear = 0;
+      const inputs = [];
+      for (const p of wanted) {
+        const { rows } = await readTab(sheetId, p.sheetTab);
+        const scoped = rowsInMonth(rows, target);
+        undatedYear += scoped.undatedYear;
+        inputs.push({ key: p.key, label: p.sheetTab, rows: scoped.rows });
+      }
+
+      const invoice = computeInvoice({ month: target, rateUsdPerHour: rate, person: who, projects: inputs });
+      const pct = (invoice.oursShare * 100).toFixed(1);
+
+      const lines = [
+        `${target} invoice at ${formatUsd(Math.round(rate * 100))}/h — ${who}`,
+        '',
+        `ours:   ${billableHours(invoice.oursMinutes).toFixed(2)}h  ${formatUsd(invoice.oursAmountCents)}  (${pct}% of logged hours)`,
+        `others: ${billableHours(invoice.othersMinutes).toFixed(2)}h  ${formatUsd(invoice.othersAmountCents)}`,
+        `total:  ${billableHours(invoice.totalMinutes).toFixed(2)}h  ${formatUsd(invoice.totalAmountCents)}`,
+        '',
+        'by project:',
+        ...invoice.byProject.map(
+          (p) =>
+            `  ${p.label.padEnd(16)} ours ${billableHours(p.oursMinutes).toFixed(2).padStart(7)}h ${formatUsd(p.oursAmountCents).padStart(11)}` +
+            `   tab ${billableHours(p.minutes).toFixed(2).padStart(7)}h ${formatUsd(p.amountCents).padStart(11)}`,
+        ),
+        '',
+        'by person:',
+        ...invoice.byPerson.map(
+          (l) =>
+            `  ${l.ours ? '*' : ' '} ${l.person.padEnd(14)} ${billableHours(l.minutes).toFixed(2).padStart(7)}h ${formatUsd(l.amountCents).padStart(11)}`,
+        ),
+      ];
+      if (invoice.unparsedRows) {
+        lines.push('', `${invoice.unparsedRows} row(s) had an unreadable Hours cell and are billed nowhere.`);
+      }
+      // Both facts are load-bearing for anyone about to send this: one tab
+      // writes bare M/D, and a month in progress is not a closed month.
+      if (undatedYear) {
+        lines.push(
+          '',
+          `${undatedYear} row(s) carry no year in the Date cell and were assumed to be ${target.slice(0, 4)}.`,
+        );
+      }
+      const today = localDayKey(new Date());
+      if (today.slice(0, 7) === target) {
+        lines.push('', `Month in progress — figures are as of ${today}.`);
       }
       return text(lines.join('\n'));
     } catch (err) {
@@ -877,10 +990,12 @@ server.registerTool(
           spreadsheetId: sheetId,
           tabTitle: p.sheetTab,
           entries,
+          ...(p.sheetProjectLabel !== undefined ? { projectLabel: p.sheetProjectLabel } : {}),
         });
         for (const e of entries) {
-          const row = toSheetRow(e);
-          lines.push(`  ${row.date} | ${row.person} | ${row.hours} | ${row.activity} | ${row.notes}`);
+          const row = toSheetRow(e, undefined, p.sheetProjectLabel);
+          const projectCell = row.project ? ` | ${row.project}` : '';
+          lines.push(`  ${row.date} | ${row.person} | ${row.hours} | ${row.activity}${projectCell} | ${row.notes}`);
         }
         for (const d of preview.duplicates) lines.push(`  possible duplicate: ${d.message}`);
 
@@ -910,6 +1025,7 @@ server.registerTool(
             spreadsheetId: sheetId,
             tabTitle: p.sheetTab,
             entries: pushing,
+            ...(p.sheetProjectLabel !== undefined ? { projectLabel: p.sheetProjectLabel } : {}),
             ...(allowDuplicates ? { allowDuplicates: true } : {}),
           });
           await markPushed(ids, result.updatedRange);

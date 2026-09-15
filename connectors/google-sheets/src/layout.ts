@@ -24,6 +24,11 @@ export interface TabLayout {
   personCol: number;
   hoursCol: number;
   activityCol: number;
+  /**
+   * null on every tab except one that rolls up several registry projects
+   * (currently only "Inc Ops") and needs to say which one a row belongs to.
+   */
+  projectCol: number | null;
   /** null when the tab has no Notes/description column. */
   notesCol: number | null;
   /** The literal header text of the activity column ("Activity" or "Category"). */
@@ -62,16 +67,23 @@ export function discoverLayout(tabTitle: string, grid: readonly string[][]): Tab
 
     if (dateCol === -1 || personCol === -1 || hoursCol === -1 || activityCol === -1) continue;
 
-    // Notes must sit immediately right of activity to count. Further right, a
-    // header like "Hours" or "SUM of Hours" belongs to a pivot table, and one
-    // tab genuinely has "Contract: 533 Hours of Dev" parked there as a label.
-    const maybeNotes = activityCol + 1;
+    // A Project column, when present, sits immediately right of Activity —
+    // "Inc Ops" rolls up ops/nixos/lpcli and needs a row to say which one it
+    // is. Notes then sits right of *that* instead of right of Activity.
+    const maybeProject = activityCol + 1;
+    const projectCol = /^project$/.test(norm(row[maybeProject])) ? maybeProject : null;
+
+    // Notes must sit immediately right of Activity (or of Project, if that's
+    // there) to count. Further right, a header like "Hours" or "SUM of Hours"
+    // belongs to a pivot table, and one tab genuinely has
+    // "Contract: 533 Hours of Dev" parked there as a label.
+    const maybeNotes = (projectCol ?? activityCol) + 1;
     const notesHeader = norm(row[maybeNotes]);
     const notesCol = /^(notes?|description|details|comments?)$/.test(notesHeader)
       ? maybeNotes
       : null;
 
-    const dataWidth = (notesCol ?? activityCol) + 1;
+    const dataWidth = (notesCol ?? projectCol ?? activityCol) + 1;
 
     return {
       tabTitle,
@@ -80,6 +92,7 @@ export function discoverLayout(tabTitle: string, grid: readonly string[][]): Tab
       personCol,
       hoursCol,
       activityCol,
+      projectCol,
       notesCol,
       activityHeader: (row[activityCol] ?? 'Activity').trim(),
       dataWidth,
@@ -125,13 +138,14 @@ export function appendRange(layout: TabLayout, lastRealRow: number): string {
 /** Build the cell array for one row, in the tab's own column order. */
 export function buildRowCells(
   layout: TabLayout,
-  row: { date: string; person: string; hours: string; activity: string; notes: string },
+  row: { date: string; person: string; hours: string; activity: string; project: string; notes: string },
 ): string[] {
   const cells = new Array<string>(layout.dataWidth).fill('');
   cells[layout.dateCol] = row.date;
   cells[layout.personCol] = row.person;
   cells[layout.hoursCol] = row.hours;
   cells[layout.activityCol] = row.activity;
+  if (layout.projectCol !== null) cells[layout.projectCol] = row.project;
   if (layout.notesCol !== null) cells[layout.notesCol] = row.notes;
   return cells;
 }

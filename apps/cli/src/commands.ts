@@ -649,7 +649,13 @@ export async function cmdPush(args: ParsedArgs): Promise<void> {
 
       // The tab just read is handed to the preview so the ceiling check does
       // not cost an extra round trip; the append re-reads it for itself.
-      preview = await previewPush({ spreadsheetId: sheetId, tabTitle: project.sheetTab, entries, tab });
+      preview = await previewPush({
+        spreadsheetId: sheetId,
+        tabTitle: project.sheetTab,
+        entries,
+        tab,
+        ...(project.sheetProjectLabel !== undefined ? { projectLabel: project.sheetProjectLabel } : {}),
+      });
     } catch (err) {
       console.log(red(`  ${err instanceof Error ? err.message : String(err)}`));
       continue;
@@ -658,8 +664,9 @@ export async function cmdPush(args: ParsedArgs): Promise<void> {
     console.log(dim(`  header row ${preview.layout.headerRow}, "${preview.layout.activityHeader}" column`));
     console.log(dim(`  appends at row ${preview.lastRealRow + 1}, below the last logged row`));
     for (const e of entries) {
-      const row = toSheetRow(e);
-      console.log(`  ${row.date}  ${row.person}  ${row.hours}  ${row.activity}  ${dim(row.notes)}`);
+      const row = toSheetRow(e, undefined, project.sheetProjectLabel);
+      const projectCell = row.project ? `  ${row.project}` : '';
+      console.log(`  ${row.date}  ${row.person}  ${row.hours}  ${row.activity}${projectCell}  ${dim(row.notes)}`);
     }
     for (const [date, mins] of preview.existingByDay) {
       if (mins > 0) {
@@ -706,6 +713,7 @@ export async function cmdPush(args: ParsedArgs): Promise<void> {
         tabTitle: project.sheetTab,
         entries: pushing,
         allowDuplicates,
+        ...(project.sheetProjectLabel !== undefined ? { projectLabel: project.sheetProjectLabel } : {}),
       });
       await markPushed(ids, result.updatedRange);
       console.log(green(`  appended ${result.rowCount} row(s) at ${result.updatedRange}`));

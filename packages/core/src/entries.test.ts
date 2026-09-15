@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { summarizeSubjects, toSheetRow, validateEntries, type Entry } from './entries.js';
 import { resolveActivity } from './taxonomy.js';
-import { projectForPath } from './projects.js';
+import { projectForPath, topLevelProjects } from './projects.js';
 
 function entry(over: Partial<Entry> = {}): Entry {
   return {
@@ -24,8 +24,14 @@ describe('toSheetRow', () => {
       person: 'Demitri',
       hours: '1:45:00',
       activity: 'Development',
+      project: '',
       notes: '9:00 AM - 10:45 AM | Stand-up',
     });
+  });
+
+  it('carries a project label when the caller supplies one', () => {
+    const row = toSheetRow(entry(), undefined, 'NixOS');
+    expect(row.project).toBe('NixOS');
   });
 
   it('omits the pipe when there is no description', () => {
@@ -147,16 +153,44 @@ describe('resolveActivity', () => {
   });
 });
 
+const watchedProjects = [
+  { key: 'north10', name: 'North10AI', sheetTab: 'North10AI', repoPaths: ['/home/mili/Projects/NorthAI'] },
+  {
+    key: 'lp',
+    name: 'LP Internal AI',
+    sheetTab: 'LP Internal AI',
+    repoPaths: ['/home/mili/Projects/lp-internal-ai-v1'],
+  },
+];
+
 describe('projectForPath', () => {
-  it('maps the two watched repos to their tabs', () => {
-    expect(projectForPath('/home/mili/Projects/NorthAI/apps/hq/page.tsx')?.sheetTab).toBe('North10AI');
-    expect(projectForPath('/home/mili/Projects/lp-internal-ai-v1/packages/db')?.sheetTab).toBe(
-      'LP Internal AI',
+  it('maps watched repos to their tabs', () => {
+    expect(projectForPath('/home/mili/Projects/NorthAI/apps/hq/page.tsx', watchedProjects)?.sheetTab).toBe(
+      'North10AI',
     );
+    expect(
+      projectForPath('/home/mili/Projects/lp-internal-ai-v1/packages/db', watchedProjects)?.sheetTab,
+    ).toBe('LP Internal AI');
   });
 
   it('returns null outside a watched repo rather than guessing a project', () => {
-    expect(projectForPath('/home/mili/Projects/BESMTools')).toBeNull();
+    expect(projectForPath('/home/mili/Projects/BESMTools', watchedProjects)).toBeNull();
+  });
+
+  it('returns null with an empty registry, the config-free default', () => {
+    expect(projectForPath('/home/mili/Projects/NorthAI/apps/hq/page.tsx')).toBeNull();
+  });
+});
+
+describe('topLevelProjects', () => {
+  it('drops sub-projects that share a parent\'s tab', () => {
+    const projects = [
+      { key: 'ops', name: 'Internal Operations', sheetTab: 'Inc Ops', repoPaths: [] },
+      { key: 'nixos', name: 'NixOS Fleet', sheetTab: 'Inc Ops', repoPaths: ['/a'], parent: 'ops' },
+      { key: 'lpcli', name: 'LPCLI', sheetTab: 'Inc Ops', repoPaths: ['/b'], parent: 'ops' },
+      ...watchedProjects,
+    ];
+    expect(topLevelProjects(projects).map((p) => p.key)).toEqual(['ops', 'north10', 'lp']);
   });
 
   it('prefers the longest matching prefix when repos nest', () => {

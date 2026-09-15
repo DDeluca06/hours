@@ -83,6 +83,7 @@ it, but those tools return an explanatory error rather than guessing your name.
 | `list_activities` | — | The fixed activity taxonomy: every acceptable value, what each is for, shorthands |
 | `get_day` | — | Entries for a day, totals, validation warnings, timer state |
 | `sheet_summary` | — | What the spreadsheet tab already says |
+| `invoice_summary` | — | Billable hours and pay for a month at the flat rate: ours, everyone else's, and the total |
 | `task_hours` | local | Whether a task has hours — OpenProject's side and the local sheet's, reported separately, never summed |
 | `log_time` | local | Record time already spent as a draft; taskId attaches it to an OpenProject work package |
 | `start_timer` | local | Begin timing; taskId attaches the result to an OpenProject work package |
@@ -95,6 +96,12 @@ it, but those tools return an explanatory error rather than guessing your name.
 
 `project` can be omitted on most tools if you pass `cwd` — the project is resolved from the
 directory through the registry, so a session in `~/Projects/NorthAI` needs no explicit key.
+
+A **sub-project** (`parent` set in the registry, e.g. `nixos`/`lpcli` under `ops`) has its own
+key and repo attribution but shares its parent's sheet tab — `log_time`/`start_timer` take its
+key like any other project, but `invoice_summary`'s default project list rolls it into its
+parent rather than double-counting the shared tab. Name it explicitly in `invoice_summary` to
+see it broken out (the numbers will match its parent's — same tab, same rows).
 
 ## Activities
 
@@ -127,8 +134,11 @@ first; the output is the literal cells that would land in the sheet.
 - "What did I do today?" → `get_day`
 - "Reconstruct today and show me the reasoning" → `reconstruct_day`
 - "Log the last 90 minutes as data model work on LP" → `log_time`
+- "Log 30 minutes of project management on internal ops, note it was the hiring sync" →
+  `log_time` with `project: "ops"` and a `note`
 - "Log 45m of data model work on task #136" → `log_time` with `taskId`
 - "How many hours does the North10AI tab have for me?" → `sheet_summary`
+- "What are we owed for August, and how much of the month is ours?" → `invoice_summary`
 - "Does task #136 already have hours on it?" → `task_hours`
 - "Approve today and show me what would go to the sheet" → `approve_day`, then
   `push_to_sheet` with `confirm: false`

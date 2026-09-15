@@ -6,3 +6,4 @@ export * from './blocks.js';
 export * from './entries.js';
 export * from './notes.js';
 export * from './taskrefs.js';
+export * from './invoice.js';

@@ -161,3 +161,34 @@ function parseSheetDate(s: string): { month: number; day: number; year: number |
   const year = raw === undefined ? null : raw.length === 2 ? 2000 + Number(raw) : Number(raw);
   return { month: Number(m[1]), day: Number(m[2]), year };
 }
+
+/**
+ * Keep only the rows a `YYYY-MM` invoice period covers.
+ *
+ * Year handling matches `sameSheetDate` and for the same reason: one tab writes
+ * "8/12" and the other "8/12/2026", so a row with no year cannot disagree with
+ * the requested one and is kept. That is deliberately generous — a bare "8/12"
+ * from a previous August would be counted — so the caller is expected to say so
+ * when it reports a total off an undated tab. Refusing those rows instead would
+ * silently drop the whole North10AI tab out of every invoice, which is worse.
+ */
+export function rowsInMonth<T extends { dateText: string }>(
+  rows: readonly T[],
+  month: string,
+): { rows: T[]; undatedYear: number } {
+  const m = /^(\d{4})-(\d{2})$/.exec(month.trim());
+  if (!m) throw new Error(`${month} is not a YYYY-MM month`);
+  const year = Number(m[1]);
+  const mon = Number(m[2]);
+
+  const kept: T[] = [];
+  let undatedYear = 0;
+  for (const row of rows) {
+    const parsed = parseSheetDate(row.dateText);
+    if (parsed === null || parsed.month !== mon) continue;
+    if (parsed.year !== null && parsed.year !== year) continue;
+    if (parsed.year === null) undatedYear += 1;
+    kept.push(row);
+  }
+  return { rows: kept, undatedYear };
+}

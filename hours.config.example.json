@@ -1,5 +1,6 @@
 {
   "person": "Your Name",
+  "rateUsdPerHour": 20,
   "workday": { "startMin": 540, "endMin": 900, "gapMin": 25 },
   "projects": [
     {
@@ -14,6 +15,21 @@
       "name": "LP Internal AI",
       "sheetTab": "LP Internal AI",
       "repoPaths": ["/absolute/path/to/lp-internal-ai-v1"]
+    },
+    {
+      "key": "ops",
+      "name": "Internal Operations",
+      "sheetTab": "Internal Ops",
+      "repoPaths": [],
+      "sheetProjectLabel": "General Infra"
+    },
+    {
+      "key": "example-tool",
+      "name": "Example Internal Tool",
+      "sheetTab": "Internal Ops",
+      "repoPaths": ["/absolute/path/to/example-tool"],
+      "parent": "ops",
+      "sheetProjectLabel": "Example Tool"
     }
   ],
   "harnesses": {
@@ -26,7 +42,9 @@
   "openproject": {
     "projects": {
       "north10": "north10-ai",
-      "lp": "internal-ai-integrations"
+      "lp": "internal-ai-integrations",
+      "ops": "internal-ops",
+      "example-tool": "example-tool"
     }
   }
 }

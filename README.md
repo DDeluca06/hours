@@ -164,7 +164,7 @@ The MCP server lets you say "log the last 90 minutes as data model work on LP" i
 session, and lets Claude working in either repo record its own time. Registration
 instructions are in [docs/mcp.md](docs/mcp.md).
 
-Tools: `list_projects` `list_activities` `get_day` `sheet_summary` `task_hours` `log_time`
+Tools: `list_projects` `list_activities` `get_day` `sheet_summary` `invoice_summary` `task_hours` `log_time`
 `start_timer` `stop_timer` `timer_status` `reconstruct_day` `edit_entry` `approve_day`
 `push_to_sheet`.
 
@@ -202,8 +202,9 @@ pnpm sheets:probe
 ```
 
 It prints every tab, which ones parse as timesheet tabs, the column layout discovered for
-each, and the totals — so you can confirm the real tab titles and column variants rather than
-trusting the defaults in the registry.
+each, and the totals — so you can confirm the real tab titles and column variants before
+typing them into the registry (there are no built-in defaults to fall back on; see
+Configuration below).
 
 ## Configuration
 
@@ -235,7 +236,46 @@ The file is **gitignored**, and the split is load-bearing in both directions: se
 stay out of the environment. `HOURS_CONFIG_FILE` points the loader at one exact file instead of
 the repo root — that is how the tests supply fixtures without touching your registry.
 
-Adding a third engagement needs no code change — add it here.
+The project registry has no built-in defaults — an empty or missing `"projects"` array means
+zero tracked projects, not a silent fallback to someone else's machine. Adding a new engagement
+needs no code change: add its entry here, and if it has OpenProject work packages, also add its
+hours key to `openproject.projects` (mapping the short registry key to the OpenProject project
+identifier, e.g. `{ "ops": "internal-ops" }`) — both places register the same project.
+
+**Sub-projects.** A small piece of internal tooling doesn't need a new tab in the shared sheet
+just to get its own repo attribution. Give it a `parent`, pointing at another project's `key`,
+and set its `sheetTab` to that same parent tab:
+
+```json
+{
+  "key": "nixos",
+  "name": "NixOS Fleet",
+  "sheetTab": "Inc Ops",
+  "repoPaths": ["/absolute/path/to/nixOS"],
+  "parent": "ops"
+}
+```
+
+It still gets its own key for `hours log`/`start_timer` and its own `repoPaths` for git
+attribution — it just writes into its parent's tab instead of a new one. Tools that iterate
+"every configured project" for a tab-level rollup (`invoice_summary`'s default) skip sub-projects
+so a shared tab isn't summed once per project registered against it; naming a sub-project
+explicitly still works, and reports that tab's numbers (identical to its parent's, since they're
+the same physical rows).
+
+This `parent` field is unrelated to — and doesn't set — OpenProject's own sub-project hierarchy.
+OpenProject nests projects under one another natively (set when the project is created or edited
+in OpenProject itself; there is no API-exposed way to do this from here, and `connectors/openproject`
+is deliberately read-only). If `nixos` is a child of `internal-ops` in OpenProject, that nesting
+lives entirely in OpenProject — this repo still just needs the flat identifier string in
+`openproject.projects`, exactly like any other project:
+
+```json
+"openproject": { "projects": { "ops": "internal-ops", "nixos": "nixos", "lpcli": "lpcli" } }
+```
+
+The two hierarchies are independent and don't need to match: a project can share a sheet tab with
+one parent here while being nested under a completely different (or no) parent in OpenProject.
 
 Which harnesses and editors get read is configured the same way, under a `harnesses` key —
 all of them by default, with environment overrides winning over the file. See

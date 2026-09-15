@@ -65,6 +65,13 @@ export interface PushOptions {
   spreadsheetId: string;
   tabTitle: string;
   entries: readonly Entry[];
+  /**
+   * Value for the tab's Project column, when it has one — every entry in one
+   * call shares a tab (and, per the caller's own grouping, a single
+   * `projectKey`), so one label covers the whole batch. `buildRowCells`
+   * ignores it on a tab with no Project column.
+   */
+  projectLabel?: string;
   /** Append even when a matching row already exists. */
   allowDuplicates?: boolean;
   /**
@@ -118,7 +125,9 @@ export async function previewPush(opts: PushOptions): Promise<PushPreview> {
   }
 
   const { layout, rows } = opts.tab ?? (await readTab(opts.spreadsheetId, opts.tabTitle));
-  const cells = opts.entries.map((e) => buildRowCells(layout, toSheetRow(e)));
+  const cells = opts.entries.map((e) =>
+    buildRowCells(layout, toSheetRow(e, undefined, opts.projectLabel)),
+  );
   const duplicates = findDuplicates(opts.entries, rows);
 
   const existingByDay = new Map<string, number>();
@@ -157,6 +166,7 @@ export async function pushEntries(opts: PushOptions): Promise<AppendResult> {
     spreadsheetId: opts.spreadsheetId,
     tabTitle: opts.tabTitle,
     entries: opts.entries,
+    ...(opts.projectLabel !== undefined ? { projectLabel: opts.projectLabel } : {}),
     ...(opts.allowDuplicates !== undefined ? { allowDuplicates: opts.allowDuplicates } : {}),
   });
 
